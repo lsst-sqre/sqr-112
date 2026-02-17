@@ -17,7 +17,7 @@ Docverse maintains its own `QueueJob` table in Postgres as the single source of 
 | `id`             | int                     | Internal PK                                                                                                    |
 | `public_id`      | int                     | Crockford Base32 serialized in API                                                                             |
 | `backend_job_id` | str (nullable)          | Reference to the queue backend's job ID (e.g., Arq UUID)                                                       |
-| `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup` |
+| `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup`, `credential_reencrypt` |
 | `status`         | enum                    | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled`                           |
 | `phase`          | str (nullable)          | Current phase: `inventory`, `tracking`, `editions`, `dashboard`                                                |
 | `org_id`         | FK → Organization       | Scoped to org (for operator filtering)                                                                         |
@@ -365,9 +365,9 @@ Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background
 
 Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that hard-deletes object store objects that have been in purgatory longer than the org's configured retention period. Simple listing + batch delete per org.
 
-#### Credential rewrap (`credential_rewrap`)
+#### Credential re-encryption (`credential_reencrypt`)
 
-Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that iterates over all `organization_credentials` rows, checks whether the `vault_ciphertext` token uses the latest key version (by inspecting the `vault:vN:...` prefix against the key's current version from Vault), and rewraps any stale entries. This ensures that after a key rotation, all stored credentials are migrated to the new key version without ever exposing plaintext. Parallelized across orgs via `asyncio.gather()`.
+Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that iterates over all `organization_credentials` rows and calls `CredentialEncryptor.rotate()` on each `encrypted_credential` value. This re-encrypts every token under the current primary Fernet key. Unlike Vault's `vault:vN:` prefix, Fernet tokens don't indicate which key encrypted them, so the job processes all rows unconditionally — `MultiFernet.rotate()` is idempotent. This ensures that after a key rotation, all stored credentials are migrated to the new key without ever exposing plaintext. Parallelized across orgs via `asyncio.gather()`.
 
 (periodic-job-scheduling)=
 
@@ -404,7 +404,7 @@ The `docverse enqueue` CLI command connects to the database and Redis, creates a
 | `lifecycle_eval`   | Daily at 03:00 UTC     | Evaluate edition and build lifecycle rules    |
 | `git_ref_audit`    | Daily at 04:00 UTC     | Verify git refs tracked by editions           |
 | `purgatory_cleanup`| Daily at 05:00 UTC     | Hard-delete expired purgatory objects          |
-| `credential_rewrap`| Weekly (Sunday 02:00)  | Rewrap Vault ciphertext to latest key version  |
+| `credential_reencrypt`| Weekly (Sunday 02:00)  | Re-encrypt credentials under current primary Fernet key |
 
 Schedules are configurable per-deployment via Phalanx Helm values. Operators can adjust frequencies, add maintenance windows, or disable specific jobs without code changes.
 

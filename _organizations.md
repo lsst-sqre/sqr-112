@@ -26,36 +26,36 @@ Each organization owns:
 
 ### Credential storage
 
-Docverse uses HashiCorp Vault's [Transit secrets engine](https://developer.hashicorp.com/vault/docs/secrets/transit) for encryption-as-a-service. Vault never stores Docverse's secrets -- it encrypts and decrypts data sent to it, with encryption keys held inside Vault's barrier. This keeps Docverse cloud-agnostic (no dependency on GCP KMS or AWS KMS) and leverages the Vault instance already running in the RSP/Phalanx stack.
+Docverse encrypts organization credentials at rest using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. Fernet provides AES-128-CBC encryption with HMAC-SHA256 authentication — ciphertext is tamper-evident and self-describing (the token embeds a timestamp and version byte). Encryption and decryption are in-process CPU-bound operations (sub-millisecond), requiring no external service calls or network round-trips. A single Fernet key is stored as a Kubernetes secret, never in the database, so database backups alone cannot decrypt credentials.
 
-Docverse uses **direct encryption** (not envelope encryption) since the payloads are small secrets like API tokens and keys. The flow: send plaintext to Vault, receive a self-describing ciphertext token (e.g., `vault:v1:XjsPWPjq...`), store the ciphertext in Postgres. To decrypt, send the ciphertext token back to Vault. The `v1` version prefix tracks which key version was used, making rotation transparent.
+This approach avoids the operational complexity of Vault Transit (running a Vault instance, configuring Kubernetes auth, managing Vault policies, network round-trips for every encrypt/decrypt) for what amounts to encrypting a small number of short API tokens and keys. The `cryptography` library is already a transitive dependency via Safir.
 
-Each organization gets its own named transit key (`docverse-org-{org_slug}`), providing tenant isolation and independent rotation schedules. Keys use the `aes256-gcm96` algorithm (Vault's default).
+#### Key provisioning
 
-#### Vault authentication
+The Fernet encryption key is provisioned through Phalanx's standard secrets management. In the application's `secrets.yaml`:
 
-Docverse authenticates to Vault using the [Kubernetes auth method](https://developer.hashicorp.com/vault/docs/auth/kubernetes). The pod's service account authenticates automatically, bound to a Vault policy scoped to Docverse's transit paths:
-
-```{code-block} text
-path "transit/encrypt/docverse-org-*" {
-    capabilities = ["update"]
-}
-path "transit/decrypt/docverse-org-*" {
-    capabilities = ["update"]
-}
-path "transit/keys/docverse-org-*" {
-    capabilities = ["create", "read", "update"]
-}
-path "transit/rewrap/docverse-org-*" {
-    capabilities = ["update"]
-}
+```{code-block} yaml
+credential-encryption-key:
+  description: >-
+    Fernet key for encrypting organization credentials at rest.
+  generate:
+    type: fernet-key
 ```
 
-This grants Docverse encrypt/decrypt/rotate/rewrap on its own keys and nothing else.
+Phalanx auto-generates the key, stores it in 1Password, and syncs it to a Kubernetes Secret. The key never appears in the database.
+
+#### Key loading
+
+At startup, the application loads the encryption key from environment variables sourced from the Kubernetes Secret:
+
+- `DOCVERSE_CREDENTIAL_ENCRYPTION_KEY` — the current primary Fernet key.
+- `DOCVERSE_CREDENTIAL_ENCRYPTION_KEY_RETIRED` (optional) — a retired key, present only during rotation periods.
+
+When both keys are present, Docverse constructs a `MultiFernet([Fernet(primary), Fernet(retired)])`. `MultiFernet` tries decryption with each key in order, so credentials encrypted under either key are readable, while new encryptions always use the primary key. When only the primary key is present, Docverse still wraps it in `MultiFernet([Fernet(primary)])` to provide a uniform interface.
 
 #### Database schema
 
-Vault's ciphertext token is self-describing (it embeds the key version, nonce, and algorithm), so the database schema is minimal -- no separate columns for nonces, DEKs, or key versions:
+Fernet tokens are self-describing (they embed a version byte, timestamp, IV, and HMAC), so the database schema needs no separate columns for nonces, key versions, or algorithm metadata:
 
 ```sql
 CREATE TABLE organization_credentials (
@@ -63,115 +63,76 @@ CREATE TABLE organization_credentials (
     organization_id UUID NOT NULL REFERENCES organizations(id),
     label TEXT NOT NULL,
     service_type TEXT NOT NULL,
-    vault_ciphertext TEXT NOT NULL,
+    encrypted_credential TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(organization_id, label)
 );
 ```
 
-The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `cloudflare`, `aws_s3`, `fastly`). Credentials are write-only through the API -- the GET response returns metadata (label, service type, timestamps) but never the decrypted value.
-
-#### Key rotation
-
-Vault Transit supports key rotation without exposing plaintext at any point:
-
-1. **Rotate the key**: creates a new key version. New encryptions use the latest version; old ciphertext remains decryptable.
-2. **Rewrap existing ciphertext**: the `rewrap` endpoint re-encrypts ciphertext from the old key version to the new one without Vault ever returning the plaintext.
-3. **Set minimum decryption version** (optional): once all ciphertext is rewrapped, retire old key versions.
-
-Docverse implements rewrapping as a periodic background job (scheduled via Kubernetes CronJob; see {ref}`periodic-job-scheduling`) that iterates over all `organization_credentials` rows and rewraps any ciphertext not using the latest key version. Since the `vault:vN:...` prefix encodes the version, detecting stale ciphertext is a string prefix check.
+The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `cloudflare`, `aws_s3`, `fastly`). Credentials are write-only through the API — the GET response returns metadata (label, service type, timestamps) but never the decrypted value.
 
 #### Python integration
 
-Docverse uses a thin async client built on `httpx` rather than the `hvac` library.
-The rationale:
-
-- Docverse is async throughout (FastAPI, async database access, async HTTP everywhere). `hvac` is synchronous, built on `requests`, and would require wrapping every call in `asyncio.to_thread`.
-- `async-hvac` exists but has spotty maintenance and only provides generic `read`/`write` methods — no structured Transit API.
-- The Vault Transit HTTP API is small and stable. A direct `httpx` wrapper covers all needed operations (create key, encrypt, decrypt, rotate, rewrap) in roughly 60 lines.
-- `httpx` is already a Docverse dependency (used for webhook delivery and external API calls), so this avoids adding `hvac`/`requests` to the dependency tree.
+`CredentialEncryptor` is a thin wrapper around `MultiFernet` that handles str↔bytes encoding:
 
 ```{code-block} python
-import base64
-from typing import Self
-
-import httpx
+from cryptography.fernet import Fernet, MultiFernet
 
 
-class VaultTransitClient:
-    """Async client for Vault Transit secrets engine."""
+class CredentialEncryptor:
+    """Encrypt and decrypt organization credentials using Fernet."""
 
-    def __init__(self, vault_addr: str, vault_token: str) -> None:
-        self._client = httpx.AsyncClient(
-            base_url=vault_addr.rstrip("/"),
-            headers={"X-Vault-Token": vault_token},
-            timeout=10.0,
-        )
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await self.aclose()
-
-    async def _post(self, path: str, **payload: object) -> dict:
-        response = await self._client.post(
-            f"/v1/transit/{path}", json=payload
-        )
-        response.raise_for_status()
-        if response.status_code == 204:
-            return {}
-        return response.json()
-
-    async def create_key(
-        self, name: str, key_type: str = "aes256-gcm96"
+    def __init__(
+        self,
+        primary_key: str,
+        retired_key: str | None = None,
     ) -> None:
-        """Create a named encryption key (idempotent)."""
-        await self._post(f"keys/{name}", type=key_type)
+        keys = [Fernet(primary_key)]
+        if retired_key:
+            keys.append(Fernet(retired_key))
+        self._fernet = MultiFernet(keys)
 
-    async def encrypt(self, key_name: str, plaintext: str) -> str:
-        """Encrypt plaintext, returning Vault ciphertext token."""
-        b64 = base64.b64encode(plaintext.encode()).decode()
-        result = await self._post(
-            f"encrypt/{key_name}", plaintext=b64
-        )
-        return result["data"]["ciphertext"]
-
-    async def decrypt(self, key_name: str, ciphertext: str) -> str:
-        """Decrypt a Vault ciphertext token."""
-        result = await self._post(
-            f"decrypt/{key_name}", ciphertext=ciphertext
-        )
-        return base64.b64decode(
-            result["data"]["plaintext"]
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt a credential, returning a Fernet token."""
+        return self._fernet.encrypt(
+            plaintext.encode()
         ).decode()
 
-    async def rotate_key(self, key_name: str) -> None:
-        """Rotate to a new key version."""
-        await self._post(f"keys/{key_name}/rotate")
+    def decrypt(self, token: str) -> str:
+        """Decrypt a Fernet token to recover the credential."""
+        return self._fernet.decrypt(
+            token.encode()
+        ).decode()
 
-    async def rewrap(
-        self, key_name: str, ciphertext: str
-    ) -> str:
-        """Re-encrypt with latest key version without
-        exposing plaintext."""
-        result = await self._post(
-            f"rewrap/{key_name}", ciphertext=ciphertext
-        )
-        return result["data"]["ciphertext"]
+    def rotate(self, token: str) -> str:
+        """Re-encrypt a token under the current primary key.
+
+        If the token is already encrypted under the primary key,
+        the result is a fresh token (new IV and timestamp) under
+        the same key. MultiFernet.rotate() is idempotent in the
+        sense that calling it repeatedly always produces a valid
+        token under the primary key.
+        """
+        return self._fernet.rotate(
+            token.encode()
+        ).decode()
 ```
 
-The same `httpx` client handles [Kubernetes auth](https://developer.hashicorp.com/vault/api-docs/auth/kubernetes#login) — a single `POST /v1/auth/kubernetes/login` with the pod's service-account JWT — plus periodic token renewal.
-This keeps Vault interaction entirely within one lightweight async client rather than pulling in `hvac` solely for authentication.
+All methods are synchronous — Fernet operations are sub-millisecond CPU-bound work, so no `async`/`await` is needed. The service layer calls `decrypt` when constructing an org-specific storage or CDN client; the plaintext is held only in memory for the duration of client construction.
 
-In the factory pattern, `VaultTransitClient` is a process-level singleton in `ProcessContext` (one `httpx.AsyncClient` shared across requests), closed during application shutdown.
-The service layer `await`s `decrypt` when it needs to construct an org-specific storage or CDN client; the plaintext is held only in memory for the duration of client construction.
+In the factory pattern, `CredentialEncryptor` is a process-level singleton in `ProcessContext`. Since it holds no network connections or file handles, no shutdown cleanup is needed.
 
-The httpx-based client is straightforward to test: unit tests can use `httpx.MockTransport` or the [`respx`](https://lundberg.github.io/respx/) library to stub Vault responses, while integration tests can point at a dev-mode Vault instance (`vault server -dev`).
+For testing, construct a `CredentialEncryptor` with `Fernet.generate_key()` — no mocking or external services required.
+
+#### Key rotation
+
+Key rotation uses `MultiFernet` to provide a zero-downtime transition:
+
+1. **Generate a new Fernet key** in 1Password (or let Phalanx regenerate).
+2. **Deploy with both keys**: set the new key as `DOCVERSE_CREDENTIAL_ENCRYPTION_KEY` and the old key as `DOCVERSE_CREDENTIAL_ENCRYPTION_KEY_RETIRED`. Restart pods. At this point, `MultiFernet` decrypts credentials under either key; new encryptions use the new key.
+3. **Run the `credential_reencrypt` job** (scheduled periodically; see {ref}`periodic-job-scheduling`). The job iterates over all `organization_credentials` rows and calls `CredentialEncryptor.rotate()`, which re-encrypts each token under the current primary key. Unlike Vault's `vault:vN:` prefix, Fernet tokens don't indicate which key encrypted them, so the job processes all rows unconditionally. `MultiFernet.rotate()` is idempotent — re-encrypting an already-migrated token simply produces a new token under the same primary key.
+4. **Remove the retired key**: once the re-encryption job completes, remove `DOCVERSE_CREDENTIAL_ENCRYPTION_KEY_RETIRED` and restart pods.
 
 ### Organization management
 
