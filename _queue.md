@@ -4,19 +4,19 @@
 
 ### Design philosophy
 
-Docverse uses [oban-py](https://github.com/oban-bg/oban-py) strictly as a **distributed job queue** — it handles scheduling, delivery, retries, and persistence. All orchestration and parallelism within a job is handled by Docverse's service layer using standard Python asyncio. This minimizes coupling to oban-py (no dependency on oban-pro's workflow system) and keeps the business logic testable with plain async functions.
+Docverse interacts with the job queue through a **backend-agnostic abstraction layer** (see {ref}`queue-backend-protocol`). The initial implementation uses [Arq](https://arq-docs.helpmanual.io/) via [Safir's ArqQueue](https://safir.lsst.io/) with Redis as the message transport. The queue backend handles delivery, retries, and worker dispatch. All orchestration and parallelism within a job is handled by Docverse's service layer using standard Python asyncio. This minimizes coupling to any specific queue technology and keeps the business logic testable with plain async functions.
 
-Each user-facing operation that triggers background work results in a **single oban job**. The job's `perform` function calls through the service layer, which coordinates the steps internally. Where steps are independent, the service layer uses `asyncio.gather()` to parallelize them.
+Each user-facing operation that triggers background work results in a **single background job**. The job's worker function calls through the service layer, which coordinates the steps internally. Where steps are independent, the service layer uses `asyncio.gather()` to parallelize them.
 
 ### QueueJob table
 
-Docverse maintains its own `QueueJob` table in Postgres as the single source of truth for job state and progress. This table serves the user-facing queue API, operator dashboards, and internal coordination (e.g., detecting conflicting concurrent edition updates). oban-py's internal job table is not queried directly for status — Docverse treats oban as a delivery mechanism only.
+Docverse maintains its own `QueueJob` table in Postgres as the single source of truth for job state and progress. This table serves the user-facing queue API, operator dashboards, and internal coordination (e.g., detecting conflicting concurrent edition updates). The queue backend's internal state is not queried directly for status — Docverse treats the backend as a delivery mechanism only.
 
 | Column           | Type                    | Description                                                                                                    |
 | ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `id`             | int                     | Internal PK                                                                                                    |
 | `public_id`      | int                     | Crockford Base32 serialized in API                                                                             |
-| `oban_job_id`    | int                     | Reference to oban's internal job ID                                                                            |
+| `backend_job_id` | str (nullable)          | Reference to the queue backend's job ID (e.g., Arq UUID)                                                       |
 | `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup` |
 | `status`         | enum                    | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled`                           |
 | `phase`          | str (nullable)          | Current phase: `inventory`, `tracking`, `editions`, `dashboard`                                                |
@@ -28,6 +28,68 @@ Docverse maintains its own `QueueJob` table in Postgres as the single source of 
 | `date_created`   | datetime                | When enqueued                                                                                                  |
 | `date_started`   | datetime (nullable)     | When a worker picked it up                                                                                     |
 | `date_completed` | datetime (nullable)     | When finished                                                                                                  |
+
+(queue-backend-protocol)=
+
+### Queue backend abstraction
+
+The queue backend is accessed through a protocol interface, following the same hexagonal architecture pattern as the object store and CDN abstractions. This keeps the service layer decoupled from any specific queue technology and allows backend swaps without disrupting application logic.
+
+#### Protocol definition
+
+```{code-block} python
+from typing import Protocol
+
+
+class QueueBackend(Protocol):
+    """Protocol for queue backend implementations."""
+
+    async def enqueue(
+        self,
+        job_type: str,
+        payload: dict,
+        *,
+        queue_name: str = "default",
+    ) -> str | None:
+        """Enqueue a job for background processing.
+
+        Returns the backend-assigned job ID (str), or None if the
+        backend does not assign IDs synchronously.
+        """
+        ...
+
+    async def get_job_metadata(
+        self, backend_job_id: str
+    ) -> dict | None:
+        """Retrieve metadata about a job from the backend.
+
+        Returns backend-specific metadata (e.g., status, result),
+        or None if the job is not found. Used for diagnostics only —
+        the QueueJob table is the authoritative state store.
+        """
+        ...
+
+    async def get_job_result(
+        self, backend_job_id: str
+    ) -> object | None:
+        """Retrieve the result of a completed job.
+
+        Returns the job result, or None if not available.
+        """
+        ...
+```
+
+#### Implementations
+
+**`ArqQueueBackend`** wraps Safir's `ArqQueue` for production use. Arq uses UUID strings as job IDs, which are stored in the `backend_job_id` column of the `QueueJob` table. The worker functions are standard async functions that receive the job payload and call through the service layer.
+
+**`MockQueueBackend`** wraps Safir's `MockArqQueue` for testing. Jobs are executed in-process, making tests deterministic without requiring a running Redis instance.
+
+Both implementations are constructed by the factory and injected into services, consistent with Docverse's dependency injection pattern.
+
+#### Infrastructure
+
+Arq requires a **Redis** instance as its message broker. In Phalanx deployments, Redis is a standard in-cluster service. The `QueueJob` Postgres table remains the authoritative state store — Redis holds only transient message data. If Redis state is lost, in-flight jobs can be re-enqueued from `QueueJob` records with `status = 'queued'`.
 
 ### Progress tracking
 
@@ -147,7 +209,7 @@ The `QueueJob` table provides a single place for operators to understand system 
 
 Triggered when a client signals upload complete (`PATCH .../builds/:build` with `status: uploaded`). This is the primary job type.
 
-The service layer executes the following steps inside the single oban job:
+The service layer executes the following steps inside the single background job:
 
 1. **Inventory** (sequential) — catalog the build's objects from the object store into the `BuildObject` table in Postgres (key, content hash, content type, size). This is a listing + metadata operation against the object store.
 
@@ -161,7 +223,7 @@ The service layer executes the following steps inside the single oban job:
 
 #### Edition reassignment (`edition_update`)
 
-Triggered when an admin PATCHes an edition with a new `build` field (manual reassignment or rollback). Simpler than build processing — a single oban job that:
+Triggered when an admin PATCHes an edition with a new `build` field (manual reassignment or rollback). Simpler than build processing — a single background job that:
 
 1. Updates the edition to point to the specified build (pointer mode KV write or copy mode diff-copy).
 2. Logs the transition to `EditionBuildHistory`.
@@ -169,27 +231,66 @@ Triggered when an admin PATCHes an edition with a new `build` field (manual reas
 
 #### Dashboard template sync (`dashboard_sync`)
 
-Triggered by a GitHub webhook when a tracked dashboard template repository is updated. A single oban job that syncs the template files from GitHub to the object store, then re-renders dashboards for all affected projects (all projects in the org for an org-level template, or a single project for a project-level override), using `asyncio.gather()` to parallelize across projects. See the {ref}`dashboards` section for the full sync flow.
+Triggered by a GitHub webhook when a tracked dashboard template repository is updated. A single background job that syncs the template files from GitHub to the object store, then re-renders dashboards for all affected projects (all projects in the org for an org-level template, or a single project for a project-level override), using `asyncio.gather()` to parallelize across projects. See the {ref}`dashboards` section for the full sync flow.
 
 #### Lifecycle evaluation (`lifecycle_eval`)
 
-Scheduled periodically via oban cron. A single oban job that scans all orgs and projects for editions and builds matching lifecycle rules (stale drafts, orphan builds). Soft-deletes matching resources and moves object store content to purgatory. Uses `asyncio.gather()` to parallelize across orgs.
+Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that scans all orgs and projects for editions and builds matching lifecycle rules (stale drafts, orphan builds). Soft-deletes matching resources and moves object store content to purgatory. Uses `asyncio.gather()` to parallelize across orgs.
 
 #### Git ref audit (`git_ref_audit`)
 
-Scheduled periodically via oban cron. A single oban job that verifies git refs tracked by editions still exist on their GitHub repositories. Flags or soft-deletes editions whose refs have been deleted (if the `ref_deleted` lifecycle rule is enabled). Catches cases where GitHub webhook delivery for ref deletion events was missed.
+Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that verifies git refs tracked by editions still exist on their GitHub repositories. Flags or soft-deletes editions whose refs have been deleted (if the `ref_deleted` lifecycle rule is enabled). Catches cases where GitHub webhook delivery for ref deletion events was missed.
 
 #### Purgatory cleanup (`purgatory_cleanup`)
 
-Scheduled periodically via oban cron. A single oban job that hard-deletes object store objects that have been in purgatory longer than the org's configured retention period. Simple listing + batch delete per org.
+Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that hard-deletes object store objects that have been in purgatory longer than the org's configured retention period. Simple listing + batch delete per org.
 
 #### Credential rewrap (`credential_rewrap`)
 
-Scheduled periodically via oban cron. A single oban job that iterates over all `organization_credentials` rows, checks whether the `vault_ciphertext` token uses the latest key version (by inspecting the `vault:vN:...` prefix against the key's current version from Vault), and rewraps any stale entries. This ensures that after a key rotation, all stored credentials are migrated to the new key version without ever exposing plaintext. Parallelized across orgs via `asyncio.gather()`.
+Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that iterates over all `organization_credentials` rows, checks whether the `vault_ciphertext` token uses the latest key version (by inspecting the `vault:vN:...` prefix against the key's current version from Vault), and rewraps any stale entries. This ensures that after a key rotation, all stored credentials are migrated to the new key version without ever exposing plaintext. Parallelized across orgs via `asyncio.gather()`.
+
+(periodic-job-scheduling)=
+
+### Periodic job scheduling
+
+Periodic jobs are scheduled using **Kubernetes CronJobs** rather than the queue backend's built-in scheduling features (e.g., Arq's cron). This keeps scheduling decoupled from the queue backend, enabling backend swaps without changing scheduling infrastructure. Kubernetes CronJobs are well-understood, observable, and already used throughout Phalanx.
+
+Each periodic job type gets a CronJob that runs a thin CLI command to create a `QueueJob` record and enqueue it via the queue backend:
+
+```{code-block} yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: docverse-lifecycle-eval
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: docverse-enqueue
+              image: ghcr.io/lsst-sqre/docverse:latest
+              command: ["docverse", "enqueue", "lifecycle_eval"]
+          restartPolicy: OnFailure
+```
+
+The `docverse enqueue` CLI command connects to the database and Redis, creates a `QueueJob` record with `status: queued`, enqueues the job via the queue backend, and exits. The actual work is performed by the Docverse worker process.
+
+#### Schedule table
+
+| Job type           | Default schedule       | Description                                  |
+| ------------------ | ---------------------- | -------------------------------------------- |
+| `lifecycle_eval`   | Daily at 03:00 UTC     | Evaluate edition and build lifecycle rules    |
+| `git_ref_audit`    | Daily at 04:00 UTC     | Verify git refs tracked by editions           |
+| `purgatory_cleanup`| Daily at 05:00 UTC     | Hard-delete expired purgatory objects          |
+| `credential_rewrap`| Weekly (Sunday 02:00)  | Rewrap Vault ciphertext to latest key version  |
+
+Schedules are configurable per-deployment via Phalanx Helm values. Operators can adjust frequencies, add maintenance windows, or disable specific jobs without code changes.
 
 ### Failure and retry
 
-oban-py handles job-level retries. The retry policy varies by job type:
+The queue backend handles job-level retries. With Arq, retry behavior is configured per job type via the worker's job definitions. The retry policy varies by job type:
 
 - **build_processing** and **edition_update**: retry with backoff, up to 3 attempts. Jobs are idempotent at each step — inventory upserts, tracking evaluation is deterministic, edition updates use diffs (already-updated editions show no changes on re-run). On retry, the job re-runs from the beginning but completed steps are effectively no-ops. The `QueueJob` progress is reset at the start of each attempt.
 - **Periodic jobs** (lifecycle_eval, git_ref_audit, purgatory_cleanup): retry once, then wait for the next scheduled run. These are self-correcting — anything missed on one run will be caught on the next.

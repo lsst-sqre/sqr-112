@@ -52,7 +52,7 @@ sequenceDiagram
 2. **Client creates a build record** via the API (`POST /orgs/:org/projects/:project/builds`). The request includes the git ref and a content hash of the tarball. The response provides a single presigned upload URL pointing to the staging location. See the {ref}`api` section for request/response details.
 3. **Client uploads the tarball** directly to the object store using the presigned URL. The tarball is a gzipped tar archive (`.tar.gz`) of the built documentation directory. The client implementation is straightforward -- `tar czf` piped to an HTTP PUT. The object store handles the bandwidth; the API server is not involved. Multipart uploads are supported where the object store provider allows (S3, GCS), enabling resumable uploads for large sites.
 4. **Client signals upload complete** (`PATCH /orgs/:org/projects/:project/builds/:build` with status update). The response includes a `queue_url` for tracking the background processing.
-5. **Background processing** -- a single oban-py job executes the build processing pipeline:
+5. **Background processing** -- a single background job executes the build processing pipeline:
    1. **Download tarball** from the staging location (staging bucket or `__staging/` prefix in the publishing bucket).
    2. **Stream-unpack and upload**: extract entries from the tar stream and upload individual files to the build's permanent prefix (`__builds/{build_id}/`) in the publishing bucket. Uploads are parallelized via an `asyncio.Semaphore`-bounded pool of concurrent uploads. For a 5,000-file Sphinx site, this processes in well under a minute.
    3. **Delete staging tarball** after successful extraction.
@@ -61,7 +61,7 @@ sequenceDiagram
    6. **Update editions** in parallel via `asyncio.gather()`.
    7. **Render project dashboard and metadata JSON** once after all edition updates.
 
-The API handler for step 4 is thin: it validates the request, updates the build status to `processing`, enqueues the single oban job, and returns the `queue_url`.
+The API handler for step 4 is thin: it validates the request, updates the build status to `processing`, enqueues the background job, and returns the `queue_url`.
 
 #### Staging location
 

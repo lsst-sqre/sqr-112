@@ -83,6 +83,17 @@ CDN implementations declare their capabilities via properties on the class.
 The key capability is **pointer mode support** (`supports_pointer_mode`): CDNs with programmable edge compute and an edge data store can resolve the edition→build mapping at the edge, while CDNs without edge compute fall back to copy mode.
 The edition update service checks `supports_pointer_mode` at runtime to select the pointer mode or copy mode code path.
 
+### Queue backend abstraction
+
+The queue backend follows the same protocol-based pattern as the object store and CDN abstractions.
+A protocol class in the domain layer defines the interface for enqueuing jobs and querying job metadata, while concrete implementations in the storage layer adapt specific queue technologies.
+
+The initial implementation uses **Arq via Safir's `ArqQueue`** with **Redis** as the message transport.
+Safir provides both the production `ArqQueue` and a `MockArqQueue` for testing, which aligns with Docverse's existing testing patterns.
+The `QueueJob` Postgres table remains the authoritative state store — the queue backend is treated as a delivery mechanism only.
+
+See the {ref}`queue-backend-protocol` section in the queue design for the full protocol definition, implementation details, and infrastructure notes.
+
 ### Service layer
 
 Services are the orchestration layer that ties storage backends, domain logic, and database stores together.

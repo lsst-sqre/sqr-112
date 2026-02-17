@@ -80,7 +80,7 @@ Vault Transit supports key rotation without exposing plaintext at any point:
 2. **Rewrap existing ciphertext**: the `rewrap` endpoint re-encrypts ciphertext from the old key version to the new one without Vault ever returning the plaintext.
 3. **Set minimum decryption version** (optional): once all ciphertext is rewrapped, retire old key versions.
 
-Docverse implements rewrapping as a periodic background job (via oban cron) that iterates over all `organization_credentials` rows and rewraps any ciphertext not using the latest key version. Since the `vault:vN:...` prefix encodes the version, detecting stale ciphertext is a string prefix check.
+Docverse implements rewrapping as a periodic background job (scheduled via Kubernetes CronJob; see {ref}`periodic-job-scheduling`) that iterates over all `organization_credentials` rows and rewraps any ciphertext not using the latest key version. Since the `vault:vN:...` prefix encodes the version, detecting stale ciphertext is a string prefix check.
 
 #### Python integration
 
@@ -190,7 +190,7 @@ Re-rendering is triggered by:
 - Project metadata changes
 - Edition updates (new build published, edition created/deleted)
 
-Dashboard rendering is handled asynchronously via the task queue (oban-py).
+Dashboard rendering is handled asynchronously via the task queue.
 
 ### Relationship to LTD Keeper v2
 

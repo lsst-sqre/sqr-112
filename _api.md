@@ -26,7 +26,7 @@ Resources use human-readable identifiers in URLs rather than auto-generated data
 | Queue job      | Crockford Base32 ID | 12 chars + checksum, hyphenated                  | `0G4R-MFBZ-K7QP-5X`                         |
 | Org membership | composite key       | `{principal_type}:{principal}`                   | `user:docverse-ci-rubin`, `group:g_spherex` |
 
-Build and queue job IDs use the [Crockford Base32 implementation from Ook](https://github.com/lsst-sqre/ook/blob/main/src/ook/domain/base32id.py), backed by `base32-lib`. IDs are stored as integers in Postgres but serialized as base32 strings with checksums in the API via Pydantic. Build IDs are randomly generated (not ordered). Queue job IDs are Docverse-owned public identifiers that map internally to oban-py's job IDs via a mapping table.
+Build and queue job IDs use the [Crockford Base32 implementation from Ook](https://github.com/lsst-sqre/ook/blob/main/src/ook/domain/base32id.py), backed by `base32-lib`. IDs are stored as integers in Postgres but serialized as base32 strings with checksums in the API via Pydantic. Build IDs are randomly generated (not ordered). Queue job IDs are Docverse-owned public identifiers that map internally to the queue backend's job IDs via the `backend_job_id` column in the `QueueJob` table.
 
 ### Ingress and authorization mapping
 
