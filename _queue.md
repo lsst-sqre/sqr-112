@@ -121,7 +121,7 @@ await queue_job_store.complete(job_id)
 
 #### Live edition progress via conditional JSONB merge
 
-During the editions phase, multiple edition update coroutines run concurrently via `asyncio.gather()`. Each coroutine updates the `progress` JSONB when it completes, using Postgres `jsonb_set` to atomically move its edition slug between the `editions_in_progress` and `editions_completed` (or `editions_failed`) arrays:
+During the editions phase, multiple edition update coroutines run concurrently via `asyncio.gather()`. Each coroutine updates the `progress` JSONB when it completes, using Postgres `jsonb_set` to atomically move its edition slug between the `editions_in_progress` and `editions_completed` (or `editions_skipped` or `editions_failed`) arrays:
 
 ```sql
 -- Mark edition completed
@@ -157,6 +157,25 @@ WHERE id = :job_id
 
 Where `failed_entry` is `{"slug": "DM-12345", "error": "R2 timeout after 3 retries"}`.
 
+For skipped editions (superseded by a newer build; see {ref}`cross-job-serialization`), the slug is moved to `editions_skipped` as a structured object with the reason:
+
+```sql
+-- Mark edition skipped
+UPDATE queue_job
+SET progress = jsonb_set(
+    jsonb_set(
+        progress,
+        '{editions_skipped}',
+        (progress->'editions_skipped') || :skipped_entry::jsonb
+    ),
+    '{editions_in_progress}',
+    (progress->'editions_in_progress') - :edition_slug
+)
+WHERE id = :job_id
+```
+
+Where `skipped_entry` is `{"slug": "v2.x", "reason": "superseded by build 01HQ-3KBR-T5GN-8W"}`.
+
 Postgres serializes the row locks, but since these are sub-millisecond metadata writes against a single row, contention is negligible compared to the actual edition update work (KV writes, cache purges, or object copies).
 
 The service layer wraps each edition update coroutine:
@@ -164,10 +183,15 @@ The service layer wraps each edition update coroutine:
 ```python
 async def _update_single_edition(self, edition, build, job_id):
     try:
-        await self._edition_service.update(edition, build)
-        await self._queue_store.mark_edition_completed(
-            job_id, edition.slug
-        )
+        skipped = await self._edition_service.update(edition, build)
+        if skipped:
+            await self._queue_store.mark_edition_skipped(
+                job_id, edition.slug, reason="superseded"
+            )
+        else:
+            await self._queue_store.mark_edition_completed(
+                job_id, edition.slug
+            )
     except Exception as e:
         await self._queue_store.mark_edition_failed(
             job_id, edition.slug, str(e)
@@ -182,7 +206,10 @@ The `progress` JSONB is phase-specific. During the editions phase:
 ```json
 {
   "editions_total": 3,
-  "editions_completed": ["__main", "v2.x"],
+  "editions_completed": ["__main"],
+  "editions_skipped": [
+    { "slug": "v2.x", "reason": "superseded by build 01HQ-3KBR-T5GN-8W" }
+  ],
   "editions_failed": [
     { "slug": "DM-12345", "error": "R2 timeout after 3 retries" }
   ],
@@ -192,13 +219,106 @@ The `progress` JSONB is phase-specific. During the editions phase:
 
 For other phases, progress can carry simpler metadata (e.g., `{"message": "Cataloging 1,247 objects"}` during inventory).
 
+(cross-job-serialization)=
+
+### Cross-job serialization
+
+Several background jobs can race on the same project's resources. Two rapid build uploads from the same branch can produce two `build_processing` jobs that both try to update the same edition concurrently. A `build_processing` job and a `dashboard_sync` job can both try to write the same project's dashboard files at the same time. An `edition_update` job and a `build_processing` job can both write the same edition's metadata JSON. Since `asyncio.gather()` parallelizes edition updates *within* a job, and multiple workers can process different jobs simultaneously, these concurrent mutations can lead to interleaved KV writes, partial cache purges, torn dashboard HTML, or inconsistent metadata JSON.
+
+Docverse prevents this with **Postgres advisory locks** at two granularities — per-edition and per-project — combined with a **stale build guard** for edition updates.
+
+#### Lock namespacing
+
+Advisory locks use the two-argument form `pg_advisory_lock(classid, objid)` to namespace by resource type, avoiding key collisions between edition and project PKs (which come from different sequences):
+
+- `pg_advisory_lock(1, edition.id)` — edition-level lock, serializes edition content updates and per-edition metadata JSON writes.
+- `pg_advisory_lock(2, project.id)` — project-level lock, serializes project-wide dashboard renders (`__dashboard.html`, `__404.html`, `__switcher.json`).
+
+Both services acquire locks through a shared `advisory_lock` async context manager that wraps the acquire/release pair, making the lock scope visually explicit and eliminating repeated `try`/`finally` boilerplate:
+
+```python
+@asynccontextmanager
+async def advisory_lock(session, classid, objid):
+    """Acquire a Postgres advisory lock for the duration of the block."""
+    await session.execute(
+        text("SELECT pg_advisory_lock(:classid, :objid)"),
+        {"classid": classid, "objid": objid},
+    )
+    try:
+        yield
+    finally:
+        await session.execute(
+            text("SELECT pg_advisory_unlock(:classid, :objid)"),
+            {"classid": classid, "objid": objid},
+        )
+```
+
+#### Advisory lock acquisition
+
+Before performing any mutation, `EditionService.update()` uses the `advisory_lock` context manager to hold an advisory lock keyed on the edition's primary key for the duration of the update:
+
+```python
+async def update(self, edition, build) -> bool:
+    """Update edition to point to build. Returns True if skipped."""
+    async with advisory_lock(self._session, 1, edition.id):
+        current_build = await self._get_current_build(edition)
+        if current_build and current_build.date_created > build.date_created:
+            return True  # Skipped — edition already has a newer build
+
+        # ... perform KV write / copy-mode update ...
+        # ... log to EditionBuildHistory ...
+        # ... write __editions/{slug}.json metadata ...
+        return False
+```
+
+The underlying `pg_advisory_lock()` call blocks (rather than failing) if another session holds the lock for the same key. This means a competing job simply waits its turn — no job is rejected or fails due to contention.
+
+#### Stale build guard
+
+After acquiring the lock, the method compares the candidate build's `date_created` against the edition's current build. If the edition already points to a newer build (because a more recent job acquired the lock first), the update is skipped. The caller logs the skip in the job's `progress` JSONB via `mark_edition_skipped`, and the edition slug appears in the `editions_skipped` array rather than `editions_completed`.
+
+This guarantees the edition never regresses to an older build, regardless of the order in which competing jobs acquire the lock.
+
+#### Project-level lock for dashboard renders
+
+`DashboardService.render(project)` acquires a project-level advisory lock before writing the project-wide dashboard files. After releasing the project lock, it acquires each edition's lock in turn to write per-edition metadata JSON, serializing against any concurrent `EditionService.update()` that writes the same file.
+
+```python
+async def render(self, project):
+    """Render all dashboard outputs for a project."""
+    # Project-wide files under project lock
+    async with advisory_lock(self._session, 2, project.id):
+        await self._write_dashboard_html(project)
+        await self._write_404_html(project)
+        await self._write_switcher_json(project)
+
+    # Per-edition metadata under individual edition locks
+    for edition in await self._get_editions(project):
+        async with advisory_lock(self._session, 1, edition.id):
+            await self._write_edition_metadata_json(edition)
+```
+
+No stale guard is needed for dashboard renders. The dashboard output is deterministic from the current database state, so the last render to complete always produces the correct output. The per-edition metadata writes can be parallelized across editions (different lock keys), but each individual write serializes against any concurrent `EditionService.update()` for the same edition.
+
+#### Why this works
+
+- **No concurrent mutation**: The edition-level advisory lock serializes all updates to a given edition, whether from `build_processing` or `edition_update` jobs. The project-level lock serializes all dashboard renders for a project, whether from build processing, edition updates, template syncs, or manual re-renders.
+- **No failures**: `pg_advisory_lock()` blocks until the lock is available — the job waits rather than failing.
+- **Correct final state**: If Build B (newer) is processed before Build A (older) due to lock acquisition order, Build A's update is skipped by the stale guard. The edition always reflects the most recent build. Dashboard renders are deterministic from database state, so the last render to complete is always correct.
+- **Compatible with `asyncio.gather()`**: Each edition's lock is independent, so parallel updates of *different* editions within the same job proceed without contention. Only updates to the *same* edition across jobs serialize. Similarly, `dashboard_sync` jobs that re-render multiple projects in parallel acquire independent project-level locks.
+- **Covers all code paths**: Placing the edition lock inside `EditionService.update()` covers both the `build_processing` parallel edition phase and the `edition_update` manual reassignment path. Placing the project lock inside `DashboardService.render()` covers all dashboard render triggers. Per-edition metadata JSON is protected in both locations — inside `EditionService.update()` and during `DashboardService.render()`'s per-edition loop.
+
+#### Connection impact
+
+The advisory lock holds a database session open for the duration of the locked operation. For edition updates in pointer mode (~2 seconds for KV write + cache purge) this is negligible. For copy mode (longer due to object copies), the session is held longer but this is acceptable given expected concurrency levels — at most a few concurrent builds per project. The project-level dashboard lock is held only for the duration of writing the three project-wide files (HTML + JSON), which is sub-second — significantly shorter than edition content updates.
+
 ### Operator queries
 
 The `QueueJob` table provides a single place for operators to understand system state across all workers:
 
 - **Backlog depth**: `SELECT count(*), kind FROM queue_job WHERE status = 'queued' GROUP BY kind`
 - **Active work**: `SELECT * FROM queue_job WHERE status = 'in_progress'` — shows what every worker is doing, which phase each job is in, and per-edition progress
-- **Edition conflict detection**: `SELECT * FROM queue_job WHERE status = 'in_progress' AND project_id = :pid AND phase = 'editions'` — inspect the `progress` JSONB to check if a specific edition is currently being updated before starting another update
+- **Edition update activity**: `SELECT * FROM queue_job WHERE status = 'in_progress' AND project_id = :pid AND phase = 'editions'` — shows concurrent edition work for a project. Advisory locks (see {ref}`cross-job-serialization`) handle serialization automatically; this query is for observability
 - **Error rates**: `SELECT count(*) FROM queue_job WHERE status IN ('failed', 'completed_with_errors') AND date_completed > now() - interval '1 hour'`
 - **Per-org throughput**: `SELECT org_id, count(*) FROM queue_job WHERE status = 'completed' AND date_completed > now() - interval '1 hour' GROUP BY org_id`
 - **Slow jobs**: `SELECT * FROM queue_job WHERE status = 'in_progress' AND date_started < now() - interval '10 minutes'`

@@ -442,3 +442,5 @@ Dashboard re-rendering is triggered by several events, all funneled through the 
 | Manual re-render                | Admin API endpoint (if needed)        | Single project or all org projects |
 
 For single-project re-renders triggered within other jobs (build processing, edition update), the render is performed inline as the final step — no separate job is enqueued. Only template syncs (which affect multiple projects) spawn their own `dashboard_sync` job.
+
+Multiple triggers can race on the same project's dashboard files (e.g., two `build_processing` jobs, or a `build_processing` and a `dashboard_sync` job running concurrently). Docverse uses Postgres advisory locks at the project and edition level to serialize these writes. See {ref}`cross-job-serialization` for the locking strategy.
