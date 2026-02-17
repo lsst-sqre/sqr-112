@@ -8,6 +8,12 @@ It can also enable SQuaRE to provide Docverse-as-a-service for partner instituti
 
 The Organization is the sole infrastructure configuration boundary — all projects within an org share the same object store, CDN, root domain, URL scheme, and default dashboard templates.
 
+Docverse follows a "bring your own infrastructure" strategy: each organization provisions and owns its cloud resources (object store buckets, CDN services, DNS zones) rather than Docverse providing centralized, shared infrastructure.
+This design is motivated by three concerns.
+First, **cost allocation** — organizations pay for and control their own cloud spend directly, avoiding the need for Docverse to meter usage or redistribute costs.
+Second, **data ownership** — organizations retain full ownership of their stored documentation artifacts; Docverse itself only stores connection metadata and encrypted credentials, never the data at rest.
+Third, **regulatory compliance** — some organizations face restrictions such as ITAR export controls that dictate where documentation can be hosted and who can access the underlying storage, requirements that are simplest to satisfy when the organization controls its own accounts.
+
 ### Organization configuration
 
 Each organization owns:
