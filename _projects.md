@@ -127,6 +127,8 @@ async def unpack_and_upload(
 
 The semaphore bounds concurrency (e.g., 50 concurrent uploads) to avoid overwhelming the object store API. Content types are inferred from file extensions.
 
+The choice of tar.gz over ZIP is deliberate. Tar archives are designed for sequential streaming (originally tape I/O), and each entry header includes the file size upfront, so the worker can stream each file directly into an object store upload without buffering. Gzip compresses the archive as a single stream, which yields better compression ratios for documentation sites whose HTML, CSS, and JavaScript files share significant redundancy — ZIP, by contrast, compresses each file independently and cannot exploit cross-file similarity. ZIP's main advantage is random access via its central directory, but that is irrelevant here since the worker extracts every file sequentially.
+
 ### Build object inventory table
 
 Each build has an associated set of object records in Postgres: key (object path), content hash (ETag or SHA-256), content type, and size. This is populated during the inventory phase of the build processing job. The inventory enables:
