@@ -27,17 +27,16 @@ docverse/                           # lsst-sqre/docverse
 │   ├── pyproject.toml              # docverse (server package)
 │   └── src/
 │       └── docverse/
-│           └── server/
-│               ├── ...
-│               └── models/         # imports and extends client models
+│           ├── ...
+│           └── models/             # imports and extends client models
 └── noxfile.py                      # shared dev tooling
 ```
 
 | Attribute     | Client                                | Server                                |
 | ------------- | ------------------------------------- | ------------------------------------- |
 | PyPI name     | `docverse-client`                     | `docverse`                            |
-| Import path   | `docverse.client`                     | `docverse.server`                     |
-| Package style | Namespace package (`docverse.client`) | Namespace package (`docverse.server`) |
+| Import path   | `docverse.client`                     | `docverse`                            |
+| Package style | Namespace package (`docverse.client`) | Namespace package (`docverse`)        |
 
 The monorepo is motivated by four concerns:
 
@@ -81,7 +80,7 @@ class BuildResponse(BaseModel):
 ```
 
 ```{code-block} python
-:caption: docverse/server/models/build.py
+:caption: docverse/models/build.py
 
 from docverse.client._models import BuildCreate as ClientBuildCreate
 from ..db import Build as BuildRow
