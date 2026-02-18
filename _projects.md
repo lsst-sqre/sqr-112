@@ -352,6 +352,26 @@ For a ref that hits the default fallback:
 
 The `rule_source` field indicates whether the rules came from `"org"`, `"project"`, or `"default"` (no rules configured, using built-in fallback).
 
+(alternate-scoped-editions)=
+
+### Compound slug derivation for alternate-scoped builds
+
+When a build includes an `alternate_name` (see {ref}`api`), slug derivation adds a scoping prefix to keep alternate-specific editions separate from generic ones:
+
+1. Apply normal slug rewrite rules to `git_ref` → base slug + edition kind.
+2. Prepend the `alternate_name` with a `--` separator: `{alternate_name}--{base_slug}`.
+3. Set the edition's tracking mode to `alternate_git_ref` with `tracking_params: {"git_ref": "<git_ref>", "alternate_name": "<alternate_name>"}`.
+
+Example: a build with `git_ref: "tickets/DM-12345"` and `alternate_name: "usdf-dev"`:
+
+- Rewrite rules produce base slug `DM-12345`, kind `draft`.
+- Final slug: `usdf-dev--DM-12345`.
+- Tracking mode: `alternate_git_ref`, tracking params: `{"git_ref": "tickets/DM-12345", "alternate_name": "usdf-dev"}`.
+
+For builds without `alternate_name`, slug derivation is unchanged.
+
+The `--` separator is chosen because it is not a valid sequence in git branch names (double hyphens are legal but uncommon), making it a reliable delimiter between the alternate name and the base slug. Slug validation still applies to the full compound slug.
+
 ### Tracking modes
 
 The full set of tracking modes in Docverse:
@@ -366,8 +386,15 @@ The full set of tracking modes in Docverse:
 | `semver_release`      | Track the latest semver release, excluding pre-releases (alpha, beta, rc)                                                         | New                            |
 | `semver_major`        | Track the latest release within a major version stream (e.g., latest `2.x.x`). Parameterized by `major_version`.                  | New                            |
 | `semver_minor`        | Track the latest release within a minor version stream (e.g., latest `2.3.x`). Parameterized by `major_version`, `minor_version`. | New                            |
+| `alternate_git_ref`   | Track a specific branch or tag scoped to an alternate name. Parameterized by `git_ref` and `alternate_name`.                       | New                            |
 
 Semver tracking supports tags both with and without a `v` prefix (e.g., `v2.1.0` and `2.1.0`).
+
+#### The `alternate_git_ref` tracking mode
+
+The `alternate_git_ref` mode is the dedicated tracking mode for deployment-scoped editions. It matches builds by **both** a specific `git_ref` **and** an `alternate_name`, parameterized via `tracking_params`. For example, edition `usdf-dev--DM-12345` uses `alternate_git_ref` with `tracking_params: {"git_ref": "tickets/DM-12345", "alternate_name": "usdf-dev"}` — it updates only when a build arrives carrying that exact git ref and alternate name pair.
+
+Builds with `alternate_name` set are **invisible to editions that do not use `alternate_git_ref`** (or otherwise filter on `alternate_name`). This prevents a deployment-specific build from accidentally updating `__main` or a generic draft edition. Conversely, builds *without* `alternate_name` are invisible to `alternate_git_ref` editions. The alternate name acts as a namespace partition within a project's build stream.
 
 ### Edition kinds
 
@@ -380,8 +407,11 @@ Edition kinds classify editions for display and lifecycle purposes:
 | `draft`   | A draft/development edition   | `git_ref` tracking a feature branch |
 | `major`   | Tracks a major version stream | `semver_major`                      |
 | `minor`   | Tracks a minor version stream | `semver_minor`                      |
+| `alternate` | An alternative product variant or deployment | `alternate_git_ref`          |
 
 When an edition is auto-created, its kind is assigned based on the tracking mode. The kind does not constrain tracking behavior — it provides context for dashboards and lifecycle rules.
+
+`alternate` editions are exempt from `draft_inactivity` lifecycle rules by default — they represent long-lived deployment targets, not transient branches. Alternate editions can be created manually via the API, or auto-created when builds carry an `alternate_name` (see below). Slug rewrite rules can also assign `edition_kind: "alternate"` to control the kind assigned during auto-creation.
 
 ### Auto-creation of editions
 
@@ -390,8 +420,13 @@ When a new build arrives and matches no existing edition's tracking criteria, Do
 - **git_ref editions**: auto-created for new branches/tags (as in LTD Keeper). Classified as `draft` kind by default.
 - **semver_major editions**: auto-created when a build introduces a new major version stream (e.g., first `v3.x.x` tag). Classified as `major` kind.
 - **semver_minor editions**: auto-created when a build introduces a new minor version stream (e.g., first `v3.1.x` tag). Classified as `minor` kind.
+- **alternate_git_ref editions**: auto-created when a build carries an `alternate_name` and its compound slug (`{alternate_name}--{base_slug}`) does not match an existing edition. The edition is created with `alternate_git_ref` tracking mode and `tracking_params` containing both the `git_ref` and `alternate_name`. The edition kind comes from slug rewrite rules applied to the base git ref (typically `draft` for ticket branches).
 
-Auto-creation for semver_major and semver_minor modes can be disabled at both the org and project level.
+  :::{note}
+  Because auto-creation derives the edition kind from slug rewrite rules, an alternate edition tracking the default branch (e.g., `usdf-dev--main`) gets kind `draft` via the default fallback — not kind `alternate`. This means it would be excluded from the version switcher (which includes kind `alternate` but not `draft`) and would be subject to `draft_inactivity` lifecycle cleanup. To avoid this, **pre-create long-lived deployment editions** with kind `alternate` via the `POST /orgs/:org/projects/:project/editions` endpoint before the first build arrives. See the {ref}`api` section for the edition creation request body.
+  :::
+
+Auto-creation for semver_major, semver_minor, and alternate_git_ref modes can be disabled at both the org and project level.
 
 ### Build annotations
 

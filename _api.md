@@ -140,6 +140,29 @@ DELETE /orgs/:org/projects/:project/editions/:ed     → soft-delete edition (ad
 
 PATCH supports setting `build` to reassign an edition to a specific build (used for rollback or manual reassignment). This enqueues an edition update task and returns a `queue_url`.
 
+The `POST` to create an edition accepts the following request body:
+
+```json
+{
+  "slug": "usdf-dev--main",
+  "title": "USDF Dev — main",
+  "kind": "alternate",
+  "tracking_mode": "alternate_git_ref",
+  "tracking_params": {
+    "git_ref": "main",
+    "alternate_name": "usdf-dev"
+  }
+}
+```
+
+| Field             | Type   | Required | Description                                                                                         |
+| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------- |
+| `slug`            | string | yes      | URL-safe edition identifier. Must be unique within the project.                                      |
+| `title`           | string | yes      | Human-readable title for dashboards and metadata.                                                    |
+| `kind`            | string | yes      | Edition kind (`main`, `release`, `draft`, `major`, `minor`, `alternate`). Controls dashboard grouping and lifecycle rule targeting. |
+| `tracking_mode`   | string | yes      | One of the supported tracking modes (see {ref}`projects`). Determines which builds update this edition. |
+| `tracking_params` | object | no       | Mode-specific parameters (e.g., `{"git_ref": "main"}` for `git_ref` mode, or `{"git_ref": "main", "alternate_name": "usdf-dev"}` for `alternate_git_ref` mode). Required for parameterized tracking modes. |
+
 ```
 GET    /orgs/:org/projects/:project/editions/:ed/history → edition-build history (reader+, paginated)
 ```
@@ -158,6 +181,7 @@ The `GET /orgs/:org/projects/:project/editions/:ed` response:
   "slug": "__main",
   "kind": "main",
   "tracking_mode": "git_ref",
+  "tracking_params": { "git_ref": "main" },
   "date_updated": "2026-02-08T12:00:00Z"
 }
 ```
@@ -179,10 +203,13 @@ Request:
 ```json
 {
   "git_ref": "main",
+  "alternate_name": "usdf-dev",
   "content_hash": "sha256:a1b2c3d4...",
   "annotations": { "kind": "release" }
 }
 ```
+
+The `alternate_name` field is optional — most projects don't use it. When present, it scopes the build to alternate-aware editions. Builds with `alternate_name` are **not** matched by generic `git_ref`-only tracking editions — the alternate name acts as a namespace. See {ref}`alternate-scoped-editions` in the projects section for details on how alternate names interact with edition tracking and slug derivation.
 
 Response:
 
