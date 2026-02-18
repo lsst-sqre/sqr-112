@@ -294,7 +294,7 @@ Deployment-scoped draft editions carry an `alternate_name` field, which template
 | `sync_id`      | str (nullable)          | Current sync version identifier (timestamp-based) |
 | `date_synced`  | datetime (nullable)     | Last successful sync                              |
 
-Unique constraint on `(org_id, project_id)` — at most one template configuration per org (where `project_id` is null) and one per project.
+Unique constraint on `(org_id, project_id)` — at most one template configuration per org (where `project_id` is null) and one per project. See {ref}`table-dashboard-template` in the database schema section for the column reference within the full schema.
 
 ### Template sync
 

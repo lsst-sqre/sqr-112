@@ -137,7 +137,7 @@ Each build has an associated set of object records in Postgres: key (object path
 - Orphan detection for build cleanup rules
 - Metadata for dashboards (e.g., build size)
 
-Note that this inventory table is motivated for the original S3 and Fastly-based architecture where editions are updated by copying the build objects. With the Cloudflare-based architecture where editions are updated by pointing to the build prefix, the inventory is less critical for edition updates but still be valuable for orphan detection and dashboard metadata.
+Note that this inventory table is motivated for the original S3 and Fastly-based architecture where editions are updated by copying the build objects. With the Cloudflare-based architecture where editions are updated by pointing to the build prefix, the inventory is less critical for edition updates but still be valuable for orphan detection and dashboard metadata. See {ref}`table-build-object` for the column definition.
 
 ### Edition overview
 
@@ -443,6 +443,8 @@ Docverse maintains an explicit log of every build that an edition has pointed to
 
 - **Rollback API**: an org admin can roll an edition back to any previous build in its history with a single API call (PATCH the edition with a `build` field pointing to the desired build).
 - **Orphan build detection**: lifecycle rules can reference history position (e.g., "a build that is 5+ versions back and older than 30 days is an orphan").
+
+See {ref}`table-edition-build-history` for the column definition.
 
 (edition-update-strategy)=
 ### Edition update strategy

@@ -10,7 +10,7 @@ Each user-facing operation that triggers background work results in a **single b
 
 ### QueueJob table
 
-Docverse maintains its own `QueueJob` table in Postgres as the single source of truth for job state and progress. This table serves the user-facing queue API, operator dashboards, and internal coordination (e.g., detecting conflicting concurrent edition updates). The queue backend's internal state is not queried directly for status — Docverse treats the backend as a delivery mechanism only.
+Docverse maintains its own `QueueJob` table in Postgres as the single source of truth for job state and progress. This table serves the user-facing queue API, operator dashboards, and internal coordination (e.g., detecting conflicting concurrent edition updates). The queue backend's internal state is not queried directly for status — Docverse treats the backend as a delivery mechanism only. See {ref}`table-queue-job` in the database schema section for the column reference within the full schema.
 
 | Column           | Type                    | Description                                                                                                    |
 | ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------- |

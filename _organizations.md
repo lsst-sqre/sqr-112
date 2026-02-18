@@ -76,7 +76,7 @@ CREATE TABLE organization_credentials (
 );
 ```
 
-The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `cloudflare`, `aws_s3`, `fastly`). Credentials are write-only through the API — the GET response returns metadata (label, service type, timestamps) but never the decrypted value.
+The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `cloudflare`, `aws_s3`, `fastly`). Credentials are write-only through the API — the GET response returns metadata (label, service type, timestamps) but never the decrypted value. See {ref}`dbschema` for all database tables and {ref}`table-organization-credentials` for the column reference.
 
 #### Python integration
 

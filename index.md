@@ -40,6 +40,10 @@ For a decade, Rubin Observatory has hosted its documentation sites with its LSST
 
 ```
 
+```{include} _dbschema.md
+
+```
+
 ```{include} _clients.md
 
 ```

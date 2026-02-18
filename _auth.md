@@ -67,6 +67,8 @@ Docverse maintains an `OrgMembership` table in its database that maps users and 
 | `principal_type` | enum              | `user` or `group`                |
 | `role`           | enum              | `reader`, `uploader`, or `admin` |
 
+See {ref}`table-org-membership` in the database schema section for the complete column reference.
+
 A membership row can reference either a **username** (for individual grants, e.g., a CI bot user) or a **group name** (for group-based grants, matching the groups from Gafaelfawr/LDAP, e.g., `g_spherex`).
 
 #### Roles
