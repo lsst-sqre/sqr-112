@@ -104,7 +104,7 @@ Org admins manage membership through the Docverse API — no Phalanx Helm change
 
 ### CI bot tokens
 
-For CI/CD pipelines (e.g., GitHub Actions uploading documentation), Gafaelfawr tokens are created using the [admin token creation API](https://gafaelfawr.lsst.io/api/rest.html#tag/admin/operation/post_admin_tokens_auth_api_v1_tokens_post) with a bot username (e.g., `bot-docverse-ci-rubin`). The resulting token string is stored as a GitHub Actions secret. The bot username is then added to the relevant org's `OrgMembership` table with the `uploader` role.
+For CI/CD pipelines (e.g., GitHub Actions uploading documentation), Gafaelfawr tokens are created using the [admin token creation API](https://gafaelfawr.lsst.io/api/rest.html#tag/admin/operation/post_admin_tokens_auth_api_v1_tokens_post) with a bot username (e.g., `bot-docverse-ci-rubin`). The resulting token string is stored as a GitHub Actions secret. The bot username is then added to the relevant org's `OrgMembership` table with the `uploader` role. See {ref}`clients` for how the Python client and GitHub Action consume these tokens.
 
 ### Testing
 

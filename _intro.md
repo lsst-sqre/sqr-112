@@ -48,3 +48,4 @@ This technote dives into the design of Docverse at a fairly technical level to p
 - [Code architecture](#code-architecture) describes Docverse's layered architecture, factory pattern for multi-tenant client construction, and protocol-based abstractions for object stores and CDN providers.
 - [Queue system](#queue) describes the queue system for processing edition updates and build uploads, built on a backend-agnostic abstraction with Arq as the initial implementation.
 - [REST API design](#api) describes the API design and schema definitions for Docverse.
+- [Docverse clients](#clients) describes the Python client library, CLI, and GitHub Actions action for uploading documentation builds, and the client-server monorepo architecture.
