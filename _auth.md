@@ -27,6 +27,20 @@ config:
     internal:
       scopes:
         - "exec:docverse"
+template:
+  metadata:
+    name: docverse-ingress
+  spec:
+    rules:
+      - http:
+          paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: docverse
+                  port:
+                    name: http
 ---
 apiVersion: gafaelfawr.lsst.io/v1alpha1
 kind: GafaelfawrIngress
@@ -37,6 +51,20 @@ config:
     all:
       - "admin:docverse"
   service: docverse
+template:
+  metadata:
+    name: docverse-admin-ingress
+  spec:
+    rules:
+      - http:
+          paths:
+            - path: /admin
+              pathType: Prefix
+              backend:
+                service:
+                  name: docverse
+                  port:
+                    name: http
 ```
 
 Gafaelfawr provides the following headers to Docverse on each authenticated request:
