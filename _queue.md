@@ -121,7 +121,7 @@ await queue_job_store.complete(job_id)
 
 #### Live edition progress via conditional JSONB merge
 
-During the editions phase, multiple edition update coroutines run concurrently via `asyncio.gather()`. Each coroutine updates the `progress` JSONB when it completes, using Postgres `jsonb_set` to atomically move its edition slug between the `editions_in_progress` and `editions_completed` (or `editions_skipped` or `editions_failed`) arrays:
+During the editions phase, multiple edition update coroutines run concurrently via `asyncio.gather()`. Each coroutine updates the `progress` JSONB when it completes, using Postgres `jsonb_set` to atomically move its edition slug between the `editions_in_progress` and `editions_completed` (as a structured object including the edition's `published_url`), `editions_skipped`, or `editions_failed` arrays:
 
 ```sql
 -- Mark edition completed
@@ -130,13 +130,15 @@ SET progress = jsonb_set(
     jsonb_set(
         progress,
         '{editions_completed}',
-        (progress->'editions_completed') || to_jsonb(:edition_slug::text)
+        (progress->'editions_completed') || :completed_entry::jsonb
     ),
     '{editions_in_progress}',
     (progress->'editions_in_progress') - :edition_slug
 )
 WHERE id = :job_id
 ```
+
+Where `completed_entry` is `{"slug": "__main", "published_url": "https://pipelines.lsst.io/"}`.
 
 For failures, the slug is moved to `editions_failed` as a structured object with error context:
 
@@ -190,7 +192,7 @@ async def _update_single_edition(self, edition, build, job_id):
             )
         else:
             await self._queue_store.mark_edition_completed(
-                job_id, edition.slug
+                job_id, edition.slug, edition.published_url
             )
     except Exception as e:
         await self._queue_store.mark_edition_failed(
@@ -206,7 +208,9 @@ The `progress` JSONB is phase-specific. During the editions phase:
 ```json
 {
   "editions_total": 3,
-  "editions_completed": ["__main"],
+  "editions_completed": [
+    { "slug": "__main", "published_url": "https://pipelines.lsst.io/" }
+  ],
   "editions_skipped": [
     { "slug": "v2.x", "reason": "superseded by build 01HQ-3KBR-T5GN-8W" }
   ],
@@ -216,6 +220,8 @@ The `progress` JSONB is phase-specific. During the editions phase:
   "editions_in_progress": []
 }
 ```
+
+The `editions_skipped` and `editions_failed` arrays already used structured objects with contextual fields (`reason` and `error`, respectively). Promoting `editions_completed` to a structured object with `published_url` makes the shape consistent across all terminal-state arrays and enables clients — particularly the GitHub Action's PR comment feature ({ref}`pr-comments`) — to discover published URLs directly from job progress without additional API calls. The `editions_in_progress` array remains a plain string array since in-progress editions have no published URL yet.
 
 For other phases, progress can carry simpler metadata (e.g., `{"message": "Cataloging 1,247 objects"}` during inventory).
 

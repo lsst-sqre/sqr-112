@@ -270,7 +270,9 @@ Queue jobs provide status tracking for background operations (build processing, 
   "phase": "editions",
   "progress": {
     "editions_total": 3,
-    "editions_completed": ["__main"],
+    "editions_completed": [
+      { "slug": "__main", "published_url": "https://pipelines.lsst.io/" }
+    ],
     "editions_failed": [],
     "editions_in_progress": ["v2.x", "DM-12345"]
   }

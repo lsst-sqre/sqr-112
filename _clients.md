@@ -254,6 +254,19 @@ A composite action that installs Python and then calls `docverse upload` would w
     token: ${{ secrets.DOCVERSE_TOKEN }}
 ```
 
+Usage with PR comments enabled:
+
+```{code-block} yaml
+- name: Upload docs to Docverse
+  uses: lsst-sqre/docverse-upload@v1
+  with:
+    org: rubin
+    project: pipelines
+    dir: _build/html
+    token: ${{ secrets.DOCVERSE_TOKEN }}
+    github-token: ${{ github.token }}
+```
+
 #### Inputs
 
 | Input            | Required | Default                    | Description                                   |
@@ -266,6 +279,7 @@ A composite action that installs Python and then calls `docverse upload` would w
 | `git-ref`        | no       | `${{ github.ref }}`        | Git ref (auto-detected from workflow context) |
 | `alternate-name` | no       | —                          | Alternate name for scoped editions            |
 | `wait`           | no       | `true`                     | Wait for processing to complete               |
+| `github-token`   | no       | —                          | GitHub token for posting PR comments with links to updated editions. Typically `${{ github.token }}`. When omitted, PR commenting is disabled. |
 
 #### Outputs
 
@@ -275,6 +289,79 @@ A composite action that installs Python and then calls `docverse upload` would w
 | `build-url`     | API URL of the created build           |
 | `published-url` | Public URL where the edition is served |
 | `job-status`    | Terminal queue job status              |
+| `editions-json` | JSON array of all updated editions with slugs and published URLs (e.g., `[{"slug": "__main", "published_url": "https://pipelines.lsst.io/"}]`) |
+
+(pr-comments)=
+
+#### Pull request comments
+
+When `github-token` is provided, the action posts or updates a comment on the associated pull request summarizing the build and linking to all updated editions.
+This gives PR reviewers immediate, clickable access to staged documentation without navigating the Docverse API or dashboards.
+
+##### PR discovery
+
+How the action finds the PR number depends on the workflow trigger event:
+
+- **`pull_request` / `pull_request_target` events**: the PR number is read directly from `github.event.pull_request.number`.
+- **`push` events**: the action queries the GitHub API (`GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`) to find open PRs for the pushed branch. If multiple PRs match, the action comments on all of them. If none match, the comment step is skipped silently.
+- **Other events** (`workflow_dispatch`, `schedule`): the comment step is skipped silently.
+
+##### Comment format
+
+The comment uses a Markdown table to list all updated editions with their published URLs:
+
+````markdown
+<!-- docverse:pr-comment:rubin/pipelines -->
+### Docverse documentation preview
+
+| Edition | URL |
+| ------- | --- |
+| `__main` | https://pipelines.lsst.io/ |
+| `DM-12345` | https://pipelines.lsst.io/v/DM-12345/ |
+
+Build `01HQ-3KBR-T5GN-8W` processed successfully.
+````
+
+Edition data is extracted from the completed job's `editions_completed` progress array (see {ref}`queue`).
+For partial failures (job status `completed_with_errors`), successful editions appear in the main table; failed and skipped editions are listed in a collapsible `<details>` block below.
+
+##### Comment deduplication
+
+A hidden HTML marker `<!-- docverse:pr-comment:{org}/{project} -->` at the top of the comment body identifies the comment, scoped by organization and project.
+On each build the action:
+
+1. Lists existing comments on the PR and searches for the marker.
+2. If found: updates the existing comment via `PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}`.
+3. If not found: creates a new comment via `POST /repos/{owner}/{repo}/issues/{pr_number}/comments`.
+
+Multi-project PRs (repositories that publish to multiple Docverse projects) get one comment per project, each independently updated.
+
+##### Edge cases
+
+- **Job failed**: the comment reports the failure status and build ID instead of an edition table.
+- **No editions updated**: the comment notes that no editions were updated and includes the build ID.
+- **Partial failure** (`completed_with_errors`): successful editions appear in the main table; failed and skipped editions are listed in a collapsible `<details>` block.
+- **Token lacks permissions**: the GitHub API returns 403; the action logs a warning via `core.warning()` but does not fail the step (the upload itself succeeded).
+- **No PR context**: the comment step is skipped silently; the build proceeds normally.
+
+##### Permissions
+
+The `github-token` requires `pull-requests: write` permission. Workflows must declare this explicitly:
+
+```{code-block} yaml
+permissions:
+  pull-requests: write
+
+steps:
+  - name: Upload docs to Docverse
+    uses: lsst-sqre/docverse-upload@v1
+    with:
+      org: rubin
+      project: pipelines
+      dir: _build/html
+      token: ${{ secrets.DOCVERSE_TOKEN }}
+      github-token: ${{ github.token }}
+```
 
 (openapi-driven-development)=
 
@@ -313,6 +400,7 @@ The action uses the `@actions/core` toolkit for runner integration:
 - **Warning annotations**: if the queue job completes with warnings (partial success), the action emits warning annotations visible in the workflow run UI.
 - **Step failure**: if the queue job fails, the action calls `core.setFailed()` with the failure reason, marking the step as failed.
 - **Outputs**: build ID, build URL, published URL, and job status are set as step outputs for downstream workflow steps to consume.
+- **PR comments**: when `github-token` is provided, posts a summary comment on the associated pull request with links to all updated editions (see {ref}`pr-comments`).
 
 ### Development workflow
 
