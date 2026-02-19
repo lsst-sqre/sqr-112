@@ -2,22 +2,11 @@
 
 ## Migration from LSST the Docs
 
-Two LSST the Docs (LTD) deployments are in scope for migration to Docverse:
+The Rubin Observatory LSST the Docs (LTD) deployment at `lsst.io` serves ~300 documentation projects for the Rubin Observatory software stack and technical notes.
+The current deployment runs LTD Keeper 1.23.0 with content stored in AWS S3, served through Fastly CDN, and uploaded via the `lsst-sqre/ltd-upload` GitHub Action and reusable workflows.
+The migration moves this deployment to Docverse, targeting Cloudflare R2 for object storage and Cloudflare Workers for the CDN edge.
 
-- **Rubin Observatory (`lsst.io`)** — the primary deployment serving ~300 documentation projects for the Rubin Observatory software stack and technical notes.
-- **SPHEREx** — a smaller deployment serving ~10–20 documentation projects for the SPHEREx mission.
-
-Each deployment has a different LTD Keeper version, different target infrastructure, and different scale.
 The migration involves three concerns: **data migration** (moving object store content and database records), **client migration** (updating CI workflows that upload documentation), and a **phased rollout** that minimizes disruption.
-
-| Attribute | Rubin (`lsst.io`) | SPHEREx |
-|---|---|---|
-| LTD Keeper version | 1.23.0 | 2.0.0-alpha.6 |
-| Source object store | AWS S3 | AWS S3 |
-| Target object store | Cloudflare R2 | AWS S3 |
-| Target CDN | Cloudflare Workers | TBD (Fastly Compute or Cloudflare) |
-| Approx. project count | ~300 | ~10–20 |
-| CI tooling | `lsst-sqre/ltd-upload` + reusable workflows | `lsst-sqre/ltd-upload` |
 
 ### Data migration
 
@@ -127,12 +116,6 @@ The migration tool should support concurrent transfers with configurable paralle
 Before the cutover, the migrated content can be verified on a test domain (e.g., `*.lsst-docs-test.org`).
 The DNS change is the point of no return — after this, all documentation traffic is served by the Cloudflare Workers stack described in {ref}`documentation-hosting`.
 Fastly configuration is retained (but not actively serving) for a rollback window.
-
-#### SPHEREx-specific notes
-
-The SPHEREx migration is a same-cloud reorganization within AWS S3.
-The data can be copied between prefixes (or buckets) within the same AWS region, making the transfer fast and free of egress charges.
-The smaller scale (~10–20 projects) means the migration can complete quickly and can be validated manually if needed.
 
 ### Client migration
 
@@ -296,4 +279,3 @@ Estimated window: 1–2 hours.
 | Gafaelfawr token provisioning issues | CI uploads fail | Medium | Provision and test org-level secrets during Phase 2 preparation; validate with test uploads before cutover |
 | Builds in flight during cutover | Some CI builds fail or upload to wrong backend | Low | Announce maintenance window in advance; re-trigger any builds that fail during the cutover window |
 | Reusable workflow update breaks downstream repos | CI failures across many repos | Low | Test reusable workflow changes against a representative sample of downstream repos before merging; reusable workflow versioning allows rollback |
-| SPHEREx migration diverges from Rubin | Duplicated effort, bugs | Low | Use the same `docverse migrate` tool for both deployments; parameterize cloud-specific behavior (S3→R2 vs. S3→S3) |
