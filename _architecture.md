@@ -261,7 +261,108 @@ The subsequent `uv pip install --no-deps` installs the actual workspace packages
 #### Release workflow
 
 - **Client** (`docverse` monorepo): released to PyPI on `client/v*` tags (e.g., `client/v1.2.0`). The GitHub Actions publish workflow runs `uv build --no-sources --package docverse-client` and uploads to PyPI. The `--no-sources` flag disables workspace source overrides so the built distribution references PyPI package names, not local paths.
-- **Server** (`docverse` monorepo): deployed as a Docker image via Phalanx. Server releases are driven by Phalanx chart version bumps, not Git tags.
+- **Server** (`docverse` monorepo): released as a Docker image on bare semver tags (e.g., `1.2.0`), following the SQuaRE convention of omitting the `v` prefix. The GitHub Actions workflow builds and pushes the Docker image. Phalanx Helm charts reference the tagged image version.
+
+#### Version metadata
+
+Both packages use [setuptools_scm](https://setuptools-scm.readthedocs.io/) to derive their version from Git tags.
+Because two independent tag namespaces coexist in one repository, each package scopes its tag matching with both `tag_regex` (for parsing) and a custom `describe_command` with `--match` (for discovery).
+Both mechanisms must be used together — `tag_regex` alone is not sufficient because `git describe` would still pick up the wrong tag.
+
+**Server** (`pyproject.toml` at repository root):
+
+```{code-block} toml
+:caption: pyproject.toml (server — version metadata)
+
+[project]
+dynamic = ["version"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+tag_regex = '(?P<version>\d+(?:\.\d+)*)$'
+
+[tool.setuptools_scm.scm.git]
+describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long",
+    "--abbrev=40", "--match", "[0-9]*",
+]
+```
+
+- `--match "[0-9]*"` ensures `git describe` only considers bare semver tags, excluding `client/v*` tags.
+- `tag_regex` matches bare `1.2.0` without a `v` prefix.
+- `fallback_version` provides a version before the first tag exists.
+
+**Client** (`client/pyproject.toml`):
+
+```{code-block} toml
+:caption: client/pyproject.toml (client — version metadata)
+
+[project]
+dynamic = ["version"]
+
+[tool.setuptools_scm]
+root = ".."
+fallback_version = "0.0.0"
+tag_regex = '^client/(?P<version>[vV]?\d+(?:\.\d+)*)$'
+
+[tool.setuptools_scm.scm.git]
+describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long",
+    "--abbrev=40", "--match", "client/v*",
+]
+```
+
+- `root = ".."` points setuptools_scm to the repository root, since `client/` is a subdirectory.
+- `--match "client/v*"` ensures `git describe` only considers client-prefixed tags.
+- `tag_regex` strips the `client/` prefix when parsing the version.
+- The slash separator in the tag prefix (`client/v1.2.0`) avoids the dash-parsing ambiguity that setuptools_scm historically had with dashed prefixes (e.g., `client-v1.2.0` could be misinterpreted as a version component separator).
+
+#### Changelog management
+
+Both packages use [scriv](https://scriv.readthedocs.io/) (>= 1.8.0) with separate configuration files and fragment directories, so each package can collect changelog entries independently at its own release cadence.
+
+**Layout:**
+
+```
+docverse/
+├── scriv-client.ini          # scriv config for client
+├── scriv-server.ini          # scriv config for server
+├── client/
+│   ├── changelog.d/          # client fragments
+│   └── CHANGELOG.md          # client changelog
+├── server-changelog.d/       # server fragments (root level)
+└── CHANGELOG.md              # server changelog
+```
+
+The scriv configuration files use `.ini` format because scriv's `--config` flag only accepts `.ini` files, not TOML.
+This means the configuration cannot live in the respective `pyproject.toml` files as `[tool.scriv]` sections.
+
+```{code-block} ini
+:caption: scriv-server.ini
+
+[scriv]
+fragment_directory = server-changelog.d
+changelog = CHANGELOG.md
+format = md
+```
+
+```{code-block} ini
+:caption: scriv-client.ini
+
+[scriv]
+fragment_directory = client/changelog.d
+changelog = client/CHANGELOG.md
+format = md
+```
+
+Usage, wrapped in nox targets for convenience:
+
+```{code-block} console
+$ scriv create --config scriv-client.ini     # new client fragment
+$ scriv create --config scriv-server.ini     # new server fragment
+$ scriv collect --config scriv-client.ini --version 1.2.0   # collect at release
+$ scriv collect --config scriv-server.ini --version 1.2.0   # collect at release
+```
 
 ### Client-owned Pydantic models
 
