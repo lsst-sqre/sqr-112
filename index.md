@@ -47,3 +47,7 @@ For a decade, Rubin Observatory has hosted its documentation sites with its LSST
 ```{include} _github_action.md
 
 ```
+
+```{include} _migration.md
+
+```

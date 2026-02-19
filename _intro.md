@@ -49,3 +49,4 @@ This technote dives into the design of Docverse at a fairly technical level to p
 - [Queue system](#queue) describes the queue system for processing edition updates and build uploads, built on a backend-agnostic abstraction with Arq as the initial implementation.
 - [REST API design](#api) describes the API design and schema definitions for Docverse.
 - [GitHub Actions action](#github-action) describes the native JavaScript GitHub Action for uploading documentation builds from GitHub Actions workflows.
+- [Migration from LSST the Docs](#migration) covers the data and client migration plan for moving existing LTD deployments to Docverse, including migration tooling, phased rollout, and risk mitigation.
