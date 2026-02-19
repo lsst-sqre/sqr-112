@@ -156,11 +156,8 @@ Only projects with custom CI workflows that reference `ltd-upload` directly need
 
 #### Option A: Retrofit the composite action
 
-Update `lsst-sqre/ltd-upload` to support Docverse as a backend when a Gafaelfawr token is provided.
-The action detects which backend to use based on which credentials are available:
-
-- If a `token` input (Gafaelfawr token) is provided → upload to Docverse.
-- If `LTD_USERNAME` / `LTD_PASSWORD` are provided (legacy) → upload to LTD.
+Update `lsst-sqre/ltd-upload` (or create a new `docverse-upload` action) to target the Docverse API.
+The action accepts a Gafaelfawr token and uploads to Docverse.
 
 The `product` input maps to the Docverse `project`; a new `org` input specifies the organization (defaulting to `rubin` for the Rubin deployment).
 GitHub organization-level secrets (`DOCVERSE_TOKEN`) provide the Gafaelfawr token to all repositories in the org without per-repo configuration.
@@ -221,7 +218,7 @@ Meanwhile, the reusable workflow pattern means that most Rubin repositories need
 The remaining repositories with custom workflows receive automated PRs.
 This makes Option A both simpler to implement and less disruptive in practice.
 
-The retrofitted `ltd-upload` action also provides a natural dual-mode transition period (see below), where repositories can be migrated incrementally rather than all at once.
+Workflow changes are prepared in advance (PRs opened, reusable workflow branches ready) and merged as part of the cutover maintenance window (see below).
 
 #### Automated PR generation
 
@@ -270,18 +267,6 @@ Or, using the dedicated `docverse-upload` action directly:
     token: ${{ secrets.DOCVERSE_TOKEN }}
 ```
 
-#### Dual-mode transition period
-
-The retrofitted `ltd-upload` action supports both backends during the transition:
-
-- If `token` (Gafaelfawr token) is provided → upload to Docverse.
-- If `LTD_USERNAME` / `LTD_PASSWORD` are provided → upload to LTD (legacy fallback).
-- If both are provided → upload to Docverse (Docverse takes precedence).
-
-This allows the transition to proceed incrementally.
-Organization-level secrets can be rolled out first (making `DOCVERSE_TOKEN` available to all repos), and then individual repositories migrate by updating their workflow files to pass the `token` input.
-Repositories that haven't been updated yet continue to work against LTD.
-
 ### Migration phases
 
 The migration proceeds in four phases, each with a clear milestone and rollback strategy:
@@ -290,12 +275,16 @@ The migration proceeds in four phases, each with a clear milestone and rollback 
 |---|---|---|---|
 | 0: Preparation | Deploy Docverse alongside LTD. Create organizations, configure object stores and CDN, provision Gafaelfawr tokens, validate with test projects. | Docverse deployed and validated with test projects | Remove Docverse deployment; no user impact (LTD unchanged) |
 | 1: Data migration | Run `docverse migrate` for all products. Verify migrated content on a test domain. LTD remains authoritative for production traffic. | All active builds and editions migrated and verified | Discard migrated data and re-run; LTD still serving production |
-| 2: Client migration | Update reusable workflows and open automated PRs for custom workflows. Dual-mode period where both backends accept uploads. | All repositories uploading to Docverse | Revert reusable workflow changes; repositories fall back to LTD via dual-mode support |
-| 3: DNS cutover | Switch `*.lsst.io` DNS from Fastly to Cloudflare. Decommission LTD Keeper and legacy S3 bucket (after retention period). | Production DNS on Cloudflare, LTD decommissioned | Revert DNS to Fastly (Fastly configuration retained for rollback window) |
+| 2: Client preparation | Prepare all workflow changes without activating them: update `ltd-upload`/`docverse-upload` action, update reusable workflows on branches, open automated PRs for custom-workflow repos. Provision `DOCVERSE_TOKEN` org-level secrets. Test against Docverse staging. | All PRs open and tested; org secrets provisioned | Close PRs; no user impact (LTD unchanged) |
+| 3: Cutover | Short maintenance window: run final data sync to capture builds since Phase 1, merge all workflow PRs and reusable workflow changes, switch `*.lsst.io` DNS from Fastly to Cloudflare. New CI builds now flow to Docverse. | Production DNS on Cloudflare, all repos uploading to Docverse | Revert DNS to Fastly and revert workflow merges; Fastly configuration retained for rollback window |
 
-**Phase 0 and Phase 1** can proceed without any user-visible changes — LTD continues to serve all production traffic.
-**Phase 2** is the most distributed phase, as it involves updating workflows across many repositories, but the dual-mode transition period ensures no repository is left without a working upload path.
-**Phase 3** is the atomic cutover — the DNS change is the single point where production traffic shifts from LTD to Docverse.
+**Phase 0 and Phase 1** proceed with no user-visible changes — LTD continues to serve all production traffic.
+**Phase 2** is preparation — PRs are opened and tested but not merged, so LTD remains fully operational.
+**Phase 3** is the atomic cutover within a short maintenance window.
+Documentation remains readable throughout (LTD serves until DNS propagates).
+The window only affects new uploads, which are briefly paused while workflow changes and DNS propagate.
+A final data sync at the start of Phase 3 ensures Docverse has all builds up to the cutover moment.
+Estimated window: 1–2 hours.
 
 ### Risk mitigation
 
@@ -304,6 +293,7 @@ The migration proceeds in four phases, each with a clear milestone and rollback 
 | Data corruption during migration | Incorrect documentation served | Low | Verify migrated content against LTD originals using content hash comparison; test domain validation before DNS cutover |
 | DNS cutover causes outage | Documentation unavailable | Low | Test DNS configuration in advance; retain Fastly configuration for rapid rollback; use low TTL during cutover window |
 | Incomplete build migration | Missing pages or broken links | Medium | Migration tool validates object counts per build against LTD inventory; flag discrepancies for manual review |
-| Gafaelfawr token provisioning issues | CI uploads fail | Medium | Provision and test org-level secrets before client migration phase; dual-mode fallback to LTD during transition |
+| Gafaelfawr token provisioning issues | CI uploads fail | Medium | Provision and test org-level secrets during Phase 2 preparation; validate with test uploads before cutover |
+| Builds in flight during cutover | Some CI builds fail or upload to wrong backend | Low | Announce maintenance window in advance; re-trigger any builds that fail during the cutover window |
 | Reusable workflow update breaks downstream repos | CI failures across many repos | Low | Test reusable workflow changes against a representative sample of downstream repos before merging; reusable workflow versioning allows rollback |
 | SPHEREx migration diverges from Rubin | Duplicated effort, bugs | Low | Use the same `docverse migrate` tool for both deployments; parameterize cloud-specific behavior (S3→R2 vs. S3→S3) |
