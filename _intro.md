@@ -45,7 +45,7 @@ This technote dives into the design of Docverse at a fairly technical level to p
 - [Projects, editions, and builds](#projects) describes the the core data model that Docverse carries over from LTD, but with substantial improvements to capabilities and performance.
 - [Documentation hosting](#documentation-hosting) explores CDN and edge compute architectures for serving documentation, explains how pointer mode eliminates the S3 copy-on-publish bottleneck, and how organizations configure hosting infrastructure.
 - [Dashboard templating system](#dashboards) describes the new dashboard templating system that allows edition dashboards to be built from templates stored in GitHub repositories.
-- [Code architecture](#code-architecture) describes Docverse's layered architecture, factory pattern for multi-tenant client construction, and protocol-based abstractions for object stores and CDN providers.
+- [Code architecture](#code-architecture) describes Docverse's layered architecture, factory pattern for multi-tenant client construction, protocol-based abstractions for object stores and CDN providers, and the client-server monorepo structure including the Python client library and CLI.
 - [Queue system](#queue) describes the queue system for processing edition updates and build uploads, built on a backend-agnostic abstraction with Arq as the initial implementation.
 - [REST API design](#api) describes the API design and schema definitions for Docverse.
-- [Docverse clients](#clients) describes the Python client library, CLI, and GitHub Actions action for uploading documentation builds, and the client-server monorepo architecture.
+- [GitHub Actions action](#github-action) describes the native JavaScript GitHub Action for uploading documentation builds from GitHub Actions workflows.

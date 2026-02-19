@@ -20,7 +20,7 @@ With Docverse, we further improve projects by removing all infrastructure config
 An issue with the LTD API was that build uploads are slow for large documentation sites.
 This was because the client uploaded each file individually using presigned URLs.
 
-Docverse uses a **tarball-to-object-store** upload model. The client compresses the built documentation into a tarball, uploads it directly to the object store via a presigned URL, then signals Docverse to process it. This avoids the performance problems of per-file presigned URLs (HTTP overhead per file, no compression, thousands of separate uploads for large Sphinx sites) and keeps the API server thin by never routing large request bodies through the API. See {ref}`clients` for the Python client library and GitHub Action that implement this upload flow.
+Docverse uses a **tarball-to-object-store** upload model. The client compresses the built documentation into a tarball, uploads it directly to the object store via a presigned URL, then signals Docverse to process it. This avoids the performance problems of per-file presigned URLs (HTTP overhead per file, no compression, thousands of separate uploads for large Sphinx sites) and keeps the API server thin by never routing large request bodies through the API. See {ref}`client-server-monorepo` for the Python client library and {ref}`github-action` for the GitHub Action that implement this upload flow.
 
 #### End-to-end flow
 
