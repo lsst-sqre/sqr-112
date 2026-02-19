@@ -112,12 +112,18 @@ This monorepo structure and the client-owned model pattern are integral to maint
 
 ### Client-server monorepo
 
-The Python client and the Docverse server share a single Git repository, following the monorepo pattern established by [Squarebot](https://github.com/lsst-sqre/squarebot):
+The Python client and the Docverse server share a single Git repository, following the monorepo pattern established by [Squarebot](https://github.com/lsst-sqre/squarebot).
+The server package lives at the repository root (matching the [Ook](https://github.com/lsst-sqre/ook) and [Safir](https://github.com/lsst-sqre/safir) conventions), which simplifies Docker builds and makes `nox-uv`'s `@session` decorator work naturally:
 
 ```
 docverse/                           # lsst-sqre/docverse
+├── pyproject.toml                  # workspace root = server package
+├── uv.lock                         # single lockfile for entire workspace
+├── noxfile.py                      # shared dev tooling
+├── ruff-shared.toml                # shared Ruff configuration
+├── Dockerfile
 ├── client/
-│   ├── pyproject.toml              # docverse-client (PyPI)
+│   ├── pyproject.toml              # docverse-client (PyPI library)
 │   └── src/
 │       └── docverse/
 │           └── client/
@@ -126,25 +132,24 @@ docverse/                           # lsst-sqre/docverse
 │               ├── _cli.py         # CLI entry point
 │               ├── _models.py      # Pydantic request/response models
 │               └── _tar.py         # Tarball creation utility
-├── server/
-│   ├── pyproject.toml              # docverse (server package)
-│   └── src/
-│       └── docverse/
-│           ├── ...
-│           └── models/             # imports and extends client models
-└── noxfile.py                      # shared dev tooling
+├── src/
+│   └── docverse/
+│       ├── ...
+│       └── models/                 # imports and extends client models
+└── tests/
 ```
 
-| Attribute     | Client                                | Server                                |
-| ------------- | ------------------------------------- | ------------------------------------- |
-| PyPI name     | `docverse-client`                     | `docverse`                            |
-| Import path   | `docverse.client`                     | `docverse`                            |
-| Package style | Namespace package (`docverse.client`) | Namespace package (`docverse`)        |
+| Attribute     | Client                                | Server                                          |
+| ------------- | ------------------------------------- | ----------------------------------------------- |
+| PyPI name     | `docverse-client`                     | `docverse`                                      |
+| Import path   | `docverse.client`                     | `docverse`                                      |
+| Package style | Namespace package (`docverse.client`) | Namespace package (`docverse`)                  |
+| Location      | `client/` subdirectory                | Repository root                                 |
 
 The monorepo is motivated by four concerns:
 
 - **Atomic model changes**: Pydantic models that define the API contract live in the client package. When an endpoint's request or response shape changes, the model update and the server handler update land in the same commit, eliminating version skew.
-- **Shared dev tooling**: a single noxfile orchestrates linting, type-checking, and testing for both packages with `pip install -e client -e server`.
+- **Shared dev tooling**: a single noxfile orchestrates linting, type-checking, and testing for both packages. The uv workspace handles editable installs of both packages automatically via `uv sync`.
 - **Unidirectional dependency**: the server depends on the client package (for the shared models); the client never imports from the server. This keeps the client lightweight and installable in CI without pulling in FastAPI, SQLAlchemy, or Redis.
 - **Lessons from LTD**: in the LTD era, the API server (`ltd-keeper`) and upload client (`ltd-conveyor`) lived in separate repositories with independently-defined models. The monorepo eliminates model drift issues between the two.
 
@@ -156,26 +161,106 @@ The OpenAPI spec serves as the contract bridge between the two repositories (see
 #### Shared noxfile
 
 The monorepo uses a shared noxfile at the repository root.
-Development sessions install both packages in editable mode:
+Sessions that need the full locked environment use `nox_uv.session`, which calls `uv sync` to install both workspace members in editable mode along with all locked dependencies:
 
 ```{code-block} python
-:caption: noxfile.py (excerpt)
+:caption: noxfile.py (excerpt — locked sessions)
 
-PIP_DEPENDENCIES = ["-e", "client", "-e", "server"]
+from nox_uv import session
+
+@session(uv_groups=["dev"])
+def test(session: nox.Session) -> None:
+    """Run server tests with locked dependencies."""
+    session.run("pytest", "tests/")
+
+@session(uv_groups=["typing", "dev"])
+def typing(session: nox.Session) -> None:
+    """Type-check both packages."""
+    session.run("mypy", "src/", "client/src/", "tests/")
 ```
 
-This allows developers to run the full test suite (client unit tests, server integration tests) and have changes to either package reflected immediately.
+Because `uv sync` installs all workspace members as editable packages, changes to either package are reflected immediately — no manual `pip install -e` step is needed.
 
 #### Dependency management
 
-The client and server follow different dependency strategies appropriate to their packaging:
+The monorepo uses a [uv workspace](https://docs.astral.sh/uv/concepts/workspaces/) with a single `uv.lock` at the repository root that replaces the traditional `server/requirements.txt` pattern.
 
-- **Client** (library): dependencies are unpinned in `pyproject.toml` with broad compatibility ranges. As a library installed in user environments and CI runners, it must be compatible with a range of dependency versions.
-- **Server** (application): dependencies are pinned via `uv pip compile` for reproducible Docker builds. The pinned requirements are regenerated in CI and committed as `server/requirements.txt`.
+**Workspace lockfile.**
+A single `uv.lock` locks all dependencies for both the server and client packages.
+uv computes the workspace's `requires-python` as the intersection of all members: if the client declares `>=3.12` and the server declares `>=3.13`, the lockfile resolves at `>=3.13`.
+The client's `pyproject.toml` still declares `>=3.12` for PyPI consumers — the lockfile constraint only affects the development environment.
+
+**Server** (`pyproject.toml` at the repository root):
+
+- `requires-python = ">=3.13"` (single target version).
+- Dependencies locked by `uv.lock` for reproducible Docker builds.
+- [Dependency groups](https://docs.astral.sh/uv/concepts/dependency-groups/) for dev tooling: `dev` (test dependencies), `lint` (pre-commit, ruff), `typing` (mypy and stubs), `nox` (nox, nox-uv).
+- `[tool.uv.sources]` maps `docverse-client` to the workspace member, so `uv sync` installs the local client in editable mode.
+
+**Client** (`client/pyproject.toml`):
+
+- `requires-python = ">=3.12"` (broad range for library consumers).
+- Dependencies use broad version ranges appropriate for a PyPI library.
+- [Dependency groups](https://docs.astral.sh/uv/concepts/dependency-groups/) mirror the server's pattern: `dev` (pytest, respx, and other test dependencies). Unlocked nox sessions read these groups via `nox.project.dependency_groups()` so the noxfile never duplicates dependency lists.
+
+#### Testing matrix
+
+The nox sessions use two distinct mechanisms to control dependency resolution:
+
+| Session | Mechanism | Resolution | Python | Purpose |
+| --- | --- | --- | --- | --- |
+| `test` | `nox_uv.session` | Locked (`uv.lock`) | 3.13 | Server tests — same deps as Docker |
+| `client-test` | `nox_uv.session` | Locked (`uv.lock`) | 3.13 | Client tests with lockfile deps |
+| `client-test-compat` | `nox.session` + `session.install` | Highest (unlocked) | 3.12, 3.13 | Client as PyPI users install it |
+| `client-test-oldest` | `nox.session` + `session.install` | `lowest-direct` | 3.12 | Validates client's lower bounds |
+| `lint` | `nox_uv.session` | Locked (`uv.lock`) | 3.13 | Pre-commit hooks |
+| `typing` | `nox_uv.session` | Locked (`uv.lock`) | 3.13 | mypy on both packages |
+
+The key distinction: **locked sessions** use `nox_uv.session` (which calls `uv sync` under the hood); **compatibility sessions** use standard `nox.session` with `session.install()` (which calls `uv pip install`, bypassing the workspace lockfile entirely).
+This separation lets the server pin exact versions for reproducibility while the client is tested against the same range of environments its PyPI users will encounter.
+
+```{code-block} python
+:caption: noxfile.py (excerpt — unlocked compatibility session)
+
+import nox
+
+CLIENT_PYPROJECT = nox.project.load_toml("client/pyproject.toml")
+
+@nox.session(python=["3.12", "3.13"])
+def client_test_compat(session: nox.Session) -> None:
+    """Test the client with unlocked highest dependencies."""
+    session.install(
+        "./client",
+        *nox.project.dependency_groups(CLIENT_PYPROJECT, "dev"),
+    )
+    session.run("pytest", "client/tests/")
+```
+
+#### Docker build
+
+The Docker build uses a two-stage pattern that separates dependency installation (layer-cached) from application code:
+
+```{code-block} dockerfile
+:caption: Dockerfile (excerpt)
+
+# Install locked dependencies (cached unless uv.lock changes)
+COPY pyproject.toml uv.lock ./
+COPY client/pyproject.toml client/pyproject.toml
+RUN uv sync --frozen --no-default-groups --no-install-workspace
+
+# Install workspace members without re-resolving
+COPY client/ client/
+COPY src/ src/
+RUN uv pip install --no-deps ./client .
+```
+
+`uv sync --frozen --no-default-groups --no-install-workspace` installs only the locked production dependencies without development groups or the workspace packages themselves.
+Both `pyproject.toml` files must be present for uv to validate the workspace structure.
+The subsequent `uv pip install --no-deps` installs the actual workspace packages without triggering a new resolution.
 
 #### Release workflow
 
-- **Client** (`docverse` monorepo): released to PyPI on `client/v*` tags (e.g., `client/v1.2.0`). The GitHub Actions publish workflow runs `uv build` in the `client/` directory and uploads to PyPI.
+- **Client** (`docverse` monorepo): released to PyPI on `client/v*` tags (e.g., `client/v1.2.0`). The GitHub Actions publish workflow runs `uv build --no-sources --package docverse-client` and uploads to PyPI. The `--no-sources` flag disables workspace source overrides so the built distribution references PyPI package names, not local paths.
 - **Server** (`docverse` monorepo): deployed as a Docker image via Phalanx. Server releases are driven by Phalanx chart version bumps, not Git tags.
 
 ### Client-owned Pydantic models
