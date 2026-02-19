@@ -27,6 +27,20 @@ config:
     internal:
       scopes:
         - "exec:docverse"
+template:
+  metadata:
+    name: docverse-ingress
+  spec:
+    rules:
+      - http:
+          paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: docverse
+                  port:
+                    name: http
 ---
 apiVersion: gafaelfawr.lsst.io/v1alpha1
 kind: GafaelfawrIngress
@@ -37,6 +51,20 @@ config:
     all:
       - "admin:docverse"
   service: docverse
+template:
+  metadata:
+    name: docverse-admin-ingress
+  spec:
+    rules:
+      - http:
+          paths:
+            - path: /admin
+              pathType: Prefix
+              backend:
+                service:
+                  name: docverse
+                  port:
+                    name: http
 ```
 
 Gafaelfawr provides the following headers to Docverse on each authenticated request:
@@ -66,6 +94,8 @@ Docverse maintains an `OrgMembership` table in its database that maps users and 
 | `principal`      | str               | A username or group name         |
 | `principal_type` | enum              | `user` or `group`                |
 | `role`           | enum              | `reader`, `uploader`, or `admin` |
+
+See {ref}`table-org-membership` in the database schema section for the complete column reference.
 
 A membership row can reference either a **username** (for individual grants, e.g., a CI bot user) or a **group name** (for group-based grants, matching the groups from Gafaelfawr/LDAP, e.g., `g_spherex`).
 
@@ -104,7 +134,7 @@ Org admins manage membership through the Docverse API — no Phalanx Helm change
 
 ### CI bot tokens
 
-For CI/CD pipelines (e.g., GitHub Actions uploading documentation), Gafaelfawr tokens are created using the [admin token creation API](https://gafaelfawr.lsst.io/api/rest.html#tag/admin/operation/post_admin_tokens_auth_api_v1_tokens_post) with a bot username (e.g., `bot-docverse-ci-rubin`). The resulting token string is stored as a GitHub Actions secret. The bot username is then added to the relevant org's `OrgMembership` table with the `uploader` role.
+For CI/CD pipelines (e.g., GitHub Actions uploading documentation), Gafaelfawr tokens are created using the [admin token creation API](https://gafaelfawr.lsst.io/api/rest.html#tag/admin/operation/post_admin_tokens_auth_api_v1_tokens_post) with a bot username (e.g., `bot-docverse-ci-rubin`). The resulting token string is stored as a GitHub Actions secret. The bot username is then added to the relevant org's `OrgMembership` table with the `uploader` role. See {ref}`client-server-monorepo` for how the Python client and {ref}`github-action` for how the GitHub Action consume these tokens.
 
 ### Testing
 

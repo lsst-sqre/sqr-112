@@ -27,7 +27,7 @@ Rather than maintain compatibility with LTD, we will migrate existing documentat
 ### Key Docverse features and changes from LTD
 
 - Implementation with FastAPI and Safir
-- Distributed queue system powered by oban-py and PostgreSQL, replacing the Celery system in LTD (other SQuaRE projects use Arq, but the future of Arq is currently uncertain)
+- Queue system built on a backend-agnostic abstraction layer, with [Arq](https://arq-docs.helpmanual.io/) (via [Safir](https://safir.lsst.io/)) and Redis as the initial implementation, replacing the Celery system in LTD. The abstraction enables future evaluation of alternative queue backends without disrupting application logic.
 - Works with Gafaelfawr tokens for authentication and group membership, replacing the custom token system in LTD
 - Organization models to support multiple organizations with separate documentation domains and configurations hosted from the same Docverse instance
 - Support for Cloudflare to provide instant edition updates.
@@ -45,6 +45,8 @@ This technote dives into the design of Docverse at a fairly technical level to p
 - [Projects, editions, and builds](#projects) describes the the core data model that Docverse carries over from LTD, but with substantial improvements to capabilities and performance.
 - [Documentation hosting](#documentation-hosting) explores CDN and edge compute architectures for serving documentation, explains how pointer mode eliminates the S3 copy-on-publish bottleneck, and how organizations configure hosting infrastructure.
 - [Dashboard templating system](#dashboards) describes the new dashboard templating system that allows edition dashboards to be built from templates stored in GitHub repositories.
-- [Code architecture](#code-architecture) describes Docverse's layered architecture, factory pattern for multi-tenant client construction, and protocol-based abstractions for object stores and CDN providers.
-- [Queue system](#queue) describes the new queue system for processing edition updates and build uploads, powered by oban-py and PostgreSQL.
+- [Code architecture](#code-architecture) describes Docverse's layered architecture, factory pattern for multi-tenant client construction, protocol-based abstractions for object stores and CDN providers, and the client-server monorepo structure including the Python client library and CLI.
+- [Queue system](#queue) describes the queue system for processing edition updates and build uploads, built on a backend-agnostic abstraction with Arq as the initial implementation.
 - [REST API design](#api) describes the API design and schema definitions for Docverse.
+- [GitHub Actions action](#github-action) describes the native JavaScript GitHub Action for uploading documentation builds from GitHub Actions workflows.
+- [Migration from LSST the Docs](#migration) covers the data and client migration plan for moving existing LTD deployments to Docverse, including migration tooling, phased rollout, and risk mitigation.

@@ -132,6 +132,7 @@ class EditionsContext:
     drafts: list[EditionContext]    # kind=draft, sorted date_updated descending
     major: list[EditionContext]     # kind=major, sorted version descending
     minor: list[EditionContext]     # kind=minor, sorted version descending
+    alternates: list[EditionContext]  # kind=alternate, sorted by title ascending
 
 @dataclass
 class EditionContext:
@@ -145,6 +146,7 @@ class EditionContext:
     date_created: datetime
     date_updated: datetime
     lifecycle_exempt: bool
+    alternate_name: str | None      # deployment/variant name, if scoped
 
 @dataclass
 class BuildContext:
@@ -156,6 +158,7 @@ class BuildContext:
     total_size_bytes: int
     date_created: datetime
     date_uploaded: datetime
+    alternate_name: str | None      # deployment/variant name, if any
 
 @dataclass
 class AssetsContext:
@@ -176,6 +179,7 @@ The `EditionsContext` provides both the flat `all` list and pre-grouped convenie
 - `releases`: semver descending (newest release first)
 - `drafts`: `date_updated` descending (most recently active first)
 - `major`/`minor`: version descending
+- `alternates`: `title` ascending
 
 #### Custom Jinja filters
 
@@ -228,6 +232,18 @@ The rendering environment registers utility filters:
   </section>
   {% endif %}
 
+  {% if editions.alternates %}
+  <section class="alternates">
+    <h2>Deployments</h2>
+    {% for edition in editions.alternates %}
+    <div class="edition-row">
+      <a href="{{ edition.published_url }}">{{ edition.title }}</a>
+      <span class="date">{{ edition.date_updated | timesince }}</span>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
   {% if editions.drafts %}
   <section class="drafts">
     <details>
@@ -251,6 +267,18 @@ The rendering environment registers utility filters:
 </html>
 ```
 
+Deployment-scoped draft editions carry an `alternate_name` field, which templates can use for filtering:
+
+```jinja
+{# Drafts for a specific deployment #}
+{% for edition in editions.drafts if edition.alternate_name == "usdf-dev" %}
+<div class="edition-row">
+  <a href="{{ edition.published_url }}">{{ edition.slug }}</a>
+  <span class="badge">usdf-dev</span>
+</div>
+{% endfor %}
+```
+
 ### DashboardTemplate table
 
 | Column         | Type                    | Description                                       |
@@ -266,7 +294,7 @@ The rendering environment registers utility filters:
 | `sync_id`      | str (nullable)          | Current sync version identifier (timestamp-based) |
 | `date_synced`  | datetime (nullable)     | Last successful sync                              |
 
-Unique constraint on `(org_id, project_id)` — at most one template configuration per org (where `project_id` is null) and one per project.
+Unique constraint on `(org_id, project_id)` — at most one template configuration per org (where `project_id` is null) and one per project. See {ref}`table-dashboard-template` in the database schema section for the column reference within the full schema.
 
 ### Template sync
 
@@ -347,13 +375,15 @@ Field mapping from Docverse's edition model:
 | `name`         | edition title or formatted slug | Display label in the dropdown                      |
 | `version`      | edition slug                    | Used by the theme for matching the current version |
 | `url`          | edition `published_url`         | Link target                                        |
-| `preferred`    | `true` for `__main` edition     | Marks the recommended/stable version               |
+| `preferred`    | `true` for `__main` and `alternate` editions | Marks the recommended/stable version        |
 
-By default, the switcher JSON includes the `__main` edition and all `release`, `major`, and `minor` editions, sorted with `__main` first then by version descending. Draft editions are excluded by default to keep the dropdown focused on stable versions. This behavior is configurable via `template.toml`:
+By default, the switcher JSON includes the `__main` edition and all `release`, `major`, `minor`, and `alternate` editions, sorted with `__main` first, then alternates alphabetically, then by version descending. Draft editions are excluded by default to keep the dropdown focused on stable versions. `alternate` editions are included because they represent long-lived deployment targets that users need to navigate between. Both `__main` and `alternate` editions get `preferred: true`, since each represents a canonical view for its context.
+
+This behavior is configurable via `template.toml`:
 
 ```toml
-    [switcher]
-    include_kinds = ["main", "release", "major"]  # default; add "draft" to include drafts
+[switcher]
+include_kinds = ["main", "release", "major", "alternate"]  # default; add "draft" to include drafts
 ```
 
 In `conf.py`, projects point the pydata-sphinx-theme at the Docverse-generated file:
@@ -442,3 +472,5 @@ Dashboard re-rendering is triggered by several events, all funneled through the 
 | Manual re-render                | Admin API endpoint (if needed)        | Single project or all org projects |
 
 For single-project re-renders triggered within other jobs (build processing, edition update), the render is performed inline as the final step — no separate job is enqueued. Only template syncs (which affect multiple projects) spawn their own `dashboard_sync` job.
+
+Multiple triggers can race on the same project's dashboard files (e.g., two `build_processing` jobs, or a `build_processing` and a `dashboard_sync` job running concurrently). Docverse uses Postgres advisory locks at the project and edition level to serialize these writes. See {ref}`cross-job-serialization` for the locking strategy.
