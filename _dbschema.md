@@ -86,7 +86,7 @@ erDiagram
     }
 
     OrgMembership {
-        UUID id PK
+        int id PK
         int org_id FK
         string principal
         enum principal_type
