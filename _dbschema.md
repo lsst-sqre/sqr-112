@@ -94,7 +94,7 @@ erDiagram
     }
 
     organization_credentials {
-        UUID id PK
+        int id PK
         int organization_id FK
         string label
         string service_type
@@ -264,7 +264,7 @@ See {ref}`auth` for the full authorization model, role definitions, and resoluti
 
 | Column           | Type              | Description |
 | ---------------- | ----------------- | ----------- |
-| `id`             | UUID              | Primary key |
+| `id`             | int               | Auto-increment primary key |
 | `org_id`         | FK → Organization | The organization |
 | `principal`      | str               | A username or group name |
 | `principal_type` | enum              | `user` or `group` |
@@ -279,7 +279,7 @@ See {ref}`organizations` for the encryption scheme, key rotation, and credential
 
 | Column                 | Type              | Description |
 | ---------------------- | ----------------- | ----------- |
-| `id`                   | UUID              | Primary key |
+| `id`                   | int               | Auto-increment primary key |
 | `organization_id`      | FK → Organization | Owning organization |
 | `label`                | str               | Human-friendly name (e.g., "Cloudflare R2 production") |
 | `service_type`         | str               | Provider identifier (e.g., `cloudflare`, `aws_s3`, `fastly`) |
