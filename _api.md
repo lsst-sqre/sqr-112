@@ -218,7 +218,7 @@ Response:
   "self_url": "https://docverse.../orgs/rubin/projects/pipelines/builds/01HQ-3KBR-T5GN-8W",
   "project_url": "https://docverse.../orgs/rubin/projects/pipelines",
   "id": "01HQ-3KBR-T5GN-8W",
-  "status": "uploading",
+  "status": "pending",
   "git_ref": "main",
   "upload_url": "https://storage.googleapis.com/docverse-staging-rubin/__staging/01HQ...tar.gz?sig=...",
   "date_created": "2026-02-08T12:00:00Z"

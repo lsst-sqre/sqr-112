@@ -216,7 +216,7 @@ See {ref}`projects` for the upload flow and processing pipeline.
 | `git_ref`          | str                     | Git branch or tag that produced this build |
 | `alternate_name`   | str (nullable)          | Deployment/variant scope (e.g., `usdf-dev`); see {ref}`alternate-scoped-editions` |
 | `content_hash`     | str                     | SHA-256 hash of the uploaded tarball for integrity verification |
-| `status`           | enum                    | `pending`, `uploading`, `processing`, `completed`, `failed` |
+| `status`           | enum                    | `pending`, `uploaded`, `processing`, `completed`, `failed` (`uploaded` is a signal-only value — never stored) |
 | `staging_key`      | str                     | Object store key for the uploaded tarball (e.g., `__staging/{build_id}.tar.gz`) |
 | `object_count`     | int                     | Number of files extracted from the tarball (populated during inventory) |
 | `total_size_bytes` | bigint                  | Total size of extracted content (populated during inventory) |
