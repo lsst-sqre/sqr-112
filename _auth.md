@@ -89,7 +89,7 @@ Docverse maintains an `OrgMembership` table in its database that maps users and 
 
 | Column           | Type              | Description                      |
 | ---------------- | ----------------- | -------------------------------- |
-| `id`             | UUID              | Primary key                      |
+| `id`             | int               | Auto-increment primary key       |
 | `org_id`         | FK → Organization | The organization                 |
 | `principal`      | str               | A username or group name         |
 | `principal_type` | enum              | `user` or `group`                |

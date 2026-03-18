@@ -86,7 +86,7 @@ erDiagram
     }
 
     OrgMembership {
-        UUID id PK
+        int id PK
         int org_id FK
         string principal
         enum principal_type
@@ -94,7 +94,7 @@ erDiagram
     }
 
     organization_credentials {
-        UUID id PK
+        int id PK
         int organization_id FK
         string label
         string service_type
@@ -199,6 +199,8 @@ See {ref}`projects` for the full behavioral design.
 | `date_updated`       | datetime                | Last modification timestamp |
 | `date_deleted`       | datetime (nullable)     | Soft-delete timestamp; `null` when active |
 
+The `projects` table requires the `pg_trgm` extension and has GIN trigram indexes on the `slug` and `title` columns to support the fuzzy search endpoint (`q` parameter on `GET /orgs/:org/projects`).
+
 (table-build)=
 
 #### Build
@@ -216,7 +218,7 @@ See {ref}`projects` for the upload flow and processing pipeline.
 | `git_ref`          | str                     | Git branch or tag that produced this build |
 | `alternate_name`   | str (nullable)          | Deployment/variant scope (e.g., `usdf-dev`); see {ref}`alternate-scoped-editions` |
 | `content_hash`     | str                     | SHA-256 hash of the uploaded tarball for integrity verification |
-| `status`           | enum                    | `pending`, `uploading`, `processing`, `completed`, `failed` |
+| `status`           | enum                    | `pending`, `uploaded`, `processing`, `completed`, `failed` (`uploaded` is a signal-only value — never stored) |
 | `staging_key`      | str                     | Object store key for the uploaded tarball (e.g., `__staging/{build_id}.tar.gz`) |
 | `object_count`     | int                     | Number of files extracted from the tarball (populated during inventory) |
 | `total_size_bytes` | bigint                  | Total size of extracted content (populated during inventory) |
@@ -264,7 +266,7 @@ See {ref}`auth` for the full authorization model, role definitions, and resoluti
 
 | Column           | Type              | Description |
 | ---------------- | ----------------- | ----------- |
-| `id`             | UUID              | Primary key |
+| `id`             | int               | Auto-increment primary key |
 | `org_id`         | FK → Organization | The organization |
 | `principal`      | str               | A username or group name |
 | `principal_type` | enum              | `user` or `group` |
@@ -279,7 +281,7 @@ See {ref}`organizations` for the encryption scheme, key rotation, and credential
 
 | Column                 | Type              | Description |
 | ---------------------- | ----------------- | ----------- |
-| `id`                   | UUID              | Primary key |
+| `id`                   | int               | Auto-increment primary key |
 | `organization_id`      | FK → Organization | Owning organization |
 | `label`                | str               | Human-friendly name (e.g., "Cloudflare R2 production") |
 | `service_type`         | str               | Provider identifier (e.g., `cloudflare`, `aws_s3`, `fastly`) |

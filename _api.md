@@ -9,7 +9,14 @@ The Docverse REST API follows SQuaRE's REST API design conventions, and specific
 - **No URL versioning**: the API has a single set of paths (no `/v1/` prefix). Breaking changes would be handled by introducing new endpoints alongside deprecated ones. A lot of design work would have to go into supporting multiple API versions simultaneously, so assuming path-based API versioning seems presumptive at this stage.
 - **HATEOAS-style navigation**: all resource representations include `self_url` and relevant navigation URLs (e.g., `project_url`, `org_url`, `builds_url`, `editions_url`). Clients navigate the API via these provided URLs rather than constructing their own.
 - **Collections are top-level arrays**: collection endpoints return a JSON array of resource objects. Pagination metadata is carried in response headers, not a wrapper object.
-- **Keyset pagination**: all collection endpoints use keyset pagination via [Safir's pagination library](https://safir.lsst.io/user-guide/database/pagination.html). Pagination cursors and links are returned in headers.
+- **Keyset pagination**: all collection endpoints use keyset pagination via [Safir's pagination library](https://safir.lsst.io/user-guide/database/pagination.html). Common query parameters:
+  - `cursor` — opaque pagination cursor string (omit for the first page).
+  - `limit` — page size, between 1 and 100 (default 25).
+  - `order` — sort field (endpoint-specific; see individual endpoint docs).
+  Response headers:
+  - `Link` — [RFC 8288](https://www.rfc-editor.org/rfc/rfc8288) links with `rel="first"`, `rel="next"`, and `rel="prev"` as applicable.
+  - `X-Total-Count` — total number of matching entries (before pagination).
+  Collections remain top-level JSON arrays; pagination metadata is carried only in headers.
 - **Errors**: all error responses follow `safir.models.ErrorModel` — a `detail` array of `{type, msg, loc?}` objects, compatible with FastAPI's built-in validation error format.
 - **Background job URLs**: when a POST or PATCH enqueues background work (e.g., build processing, edition updates), the response includes a `queue_url` pointing to the job status resource.
 
@@ -111,6 +118,17 @@ PATCH  /orgs/:org/projects/:project                  → update project (admin)
 DELETE /orgs/:org/projects/:project                  → soft-delete project (admin)
 ```
 
+Query parameters for `GET /orgs/:org/projects`:
+
+| Parameter | Type   | Default | Description                                           |
+| --------- | ------ | ------- | ----------------------------------------------------- |
+| `order`   | string | `slug`  | Sort field: `slug` (ASC) or `date_created` (DESC)     |
+| `cursor`  | string | —       | Opaque pagination cursor                               |
+| `limit`   | int    | 25      | Page size (1–100)                                      |
+| `q`       | string | —       | Fuzzy search query (1–256 characters)                  |
+
+The `q` parameter enables fuzzy search across project slug and title using PostgreSQL trigram similarity (`pg_trgm`). When `q` is provided, results are ranked by relevance (highest similarity score first) rather than the `order` field, and the `cursor` parameter cannot be used — combining `q` with `cursor` returns a 422 error. A minimum similarity threshold of 0.1 filters low-quality matches. Search results are returned as a single page (up to `limit` entries) with no pagination cursors.
+
 The `GET /orgs/:org/projects/:project` response includes navigation URLs:
 
 ```json
@@ -137,6 +155,15 @@ GET    /orgs/:org/projects/:project/editions/:ed     → get edition (reader+)
 PATCH  /orgs/:org/projects/:project/editions/:ed     → update edition (admin)
 DELETE /orgs/:org/projects/:project/editions/:ed     → soft-delete edition (admin)
 ```
+
+Query parameters for `GET .../editions`:
+
+| Parameter | Type   | Default | Description                                                           |
+| --------- | ------ | ------- | --------------------------------------------------------------------- |
+| `order`   | string | `slug`  | Sort field: `slug` (ASC), `date_created` (DESC), or `date_updated` (DESC) |
+| `kind`    | string | —       | Filter by edition kind (`main`, `release`, `draft`, etc.)             |
+| `cursor`  | string | —       | Opaque pagination cursor                                               |
+| `limit`   | int    | 25      | Page size (1–100)                                                      |
 
 PATCH supports setting `build` to reassign an edition to a specific build (used for rollback or manual reassignment). This enqueues an edition update task and returns a `queue_url`.
 
@@ -196,6 +223,16 @@ PATCH  /orgs/:org/projects/:project/builds/:build    → signal upload complete 
 DELETE /orgs/:org/projects/:project/builds/:build    → soft-delete build (admin)
 ```
 
+Query parameters for `GET .../builds`:
+
+| Parameter | Type   | Default | Description                                                    |
+| --------- | ------ | ------- | -------------------------------------------------------------- |
+| `status`  | string | —       | Filter by build status (`pending`, `processing`, `completed`, `failed`) |
+| `cursor`  | string | —       | Opaque pagination cursor                                        |
+| `limit`   | int    | 25      | Page size (1–100)                                               |
+
+Builds are always sorted by `date_created` descending (newest first).
+
 The `POST` to create a build returns a single presigned upload URL for the tarball:
 
 Request:
@@ -218,7 +255,7 @@ Response:
   "self_url": "https://docverse.../orgs/rubin/projects/pipelines/builds/01HQ-3KBR-T5GN-8W",
   "project_url": "https://docverse.../orgs/rubin/projects/pipelines",
   "id": "01HQ-3KBR-T5GN-8W",
-  "status": "uploading",
+  "status": "pending",
   "git_ref": "main",
   "upload_url": "https://storage.googleapis.com/docverse-staging-rubin/__staging/01HQ...tar.gz?sig=...",
   "date_created": "2026-02-08T12:00:00Z"
