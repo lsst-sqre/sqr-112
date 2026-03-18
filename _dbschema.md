@@ -199,6 +199,8 @@ See {ref}`projects` for the full behavioral design.
 | `date_updated`       | datetime                | Last modification timestamp |
 | `date_deleted`       | datetime (nullable)     | Soft-delete timestamp; `null` when active |
 
+The `projects` table requires the `pg_trgm` extension and has GIN trigram indexes on the `slug` and `title` columns to support the fuzzy search endpoint (`q` parameter on `GET /orgs/:org/projects`).
+
 (table-build)=
 
 #### Build

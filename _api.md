@@ -125,6 +125,9 @@ Query parameters for `GET /orgs/:org/projects`:
 | `order`   | string | `slug`  | Sort field: `slug` (ASC) or `date_created` (DESC)     |
 | `cursor`  | string | —       | Opaque pagination cursor                               |
 | `limit`   | int    | 25      | Page size (1–100)                                      |
+| `q`       | string | —       | Fuzzy search query (1–256 characters)                  |
+
+The `q` parameter enables fuzzy search across project slug and title using PostgreSQL trigram similarity (`pg_trgm`). When `q` is provided, results are ranked by relevance (highest similarity score first) rather than the `order` field, and the `cursor` parameter cannot be used — combining `q` with `cursor` returns a 422 error. A minimum similarity threshold of 0.1 filters low-quality matches. Search results are returned as a single page (up to `limit` entries) with no pagination cursors.
 
 The `GET /orgs/:org/projects/:project` response includes navigation URLs:
 
