@@ -61,7 +61,7 @@ When both keys are present, Docverse constructs a `MultiFernet([Fernet(primary),
 
 #### Database schema
 
-Fernet tokens are self-describing (they embed a version byte, timestamp, IV, and HMAC), so the database schema needs no separate columns for nonces, key versions, or algorithm metadata:
+The implementation stores raw Fernet token bytes (not base64-encoded text). Fernet tokens are self-describing (they embed a version byte, timestamp, IV, and HMAC), so the database schema needs no separate columns for nonces, key versions, or algorithm metadata:
 
 ```sql
 CREATE TABLE organization_credentials (
@@ -69,18 +69,18 @@ CREATE TABLE organization_credentials (
     organization_id INTEGER NOT NULL REFERENCES organizations(id),
     label TEXT NOT NULL,
     service_type TEXT NOT NULL,
-    encrypted_credential TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    encrypted_credential BYTEA NOT NULL,
+    date_created TIMESTAMPTZ NOT NULL DEFAULT now(),
+    date_updated TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(organization_id, label)
 );
 ```
 
-The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `cloudflare`, `aws_s3`, `fastly`). Credentials are write-only through the API — the GET response returns metadata (label, service type, timestamps) but never the decrypted value. See {ref}`dbschema` for all database tables and {ref}`table-organization-credentials` for the column reference.
+The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `s3`, `r2`, `minio`). The `s3` type covers AWS S3 and generic S3-compatible services; `r2` covers Cloudflare R2; `minio` covers MinIO deployments. Credentials are write-only through the API — the GET response returns metadata (label, service type, timestamps) but never the decrypted value. See {ref}`dbschema` for all database tables and {ref}`table-organization-credentials` for the column reference.
 
 #### Python integration
 
-`CredentialEncryptor` is a thin wrapper around `MultiFernet` that handles str↔bytes encoding:
+`CredentialEncryptor` is a thin wrapper around `MultiFernet` that operates on raw bytes:
 
 ```{code-block} python
 from cryptography.fernet import Fernet, MultiFernet
@@ -91,41 +91,29 @@ class CredentialEncryptor:
 
     def __init__(
         self,
-        primary_key: str,
+        *,
+        current_key: str,
         retired_key: str | None = None,
     ) -> None:
-        keys = [Fernet(primary_key)]
-        if retired_key:
+        keys = [Fernet(current_key)]
+        if retired_key is not None:
             keys.append(Fernet(retired_key))
         self._fernet = MultiFernet(keys)
 
-    def encrypt(self, plaintext: str) -> str:
+    def encrypt(self, plaintext: bytes) -> bytes:
         """Encrypt a credential, returning a Fernet token."""
-        return self._fernet.encrypt(
-            plaintext.encode()
-        ).decode()
+        return self._fernet.encrypt(plaintext)
 
-    def decrypt(self, token: str) -> str:
+    def decrypt(self, token: bytes) -> bytes:
         """Decrypt a Fernet token to recover the credential."""
-        return self._fernet.decrypt(
-            token.encode()
-        ).decode()
+        return self._fernet.decrypt(token)
 
-    def rotate(self, token: str) -> str:
-        """Re-encrypt a token under the current primary key.
-
-        If the token is already encrypted under the primary key,
-        the result is a fresh token (new IV and timestamp) under
-        the same key. MultiFernet.rotate() is idempotent in the
-        sense that calling it repeatedly always produces a valid
-        token under the primary key.
-        """
-        return self._fernet.rotate(
-            token.encode()
-        ).decode()
+    def rotate(self, token: bytes) -> bytes:
+        """Re-encrypt a token under the current primary key."""
+        return self._fernet.rotate(token)
 ```
 
-All methods are synchronous — Fernet operations are sub-millisecond CPU-bound work, so no `async`/`await` is needed. The service layer calls `decrypt` when constructing an org-specific storage or CDN client; the plaintext is held only in memory for the duration of client construction.
+All methods are synchronous — Fernet operations are sub-millisecond CPU-bound work, so no `async`/`await` is needed. The service layer JSON-encodes credential dicts to bytes before encryption and JSON-decodes after decryption. The plaintext is held only in memory for the duration of client construction.
 
 In the factory pattern, `CredentialEncryptor` is a process-level singleton in `ProcessContext`. Since it holds no network connections or file handles, no shutdown cleanup is needed.
 
