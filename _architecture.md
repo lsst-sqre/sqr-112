@@ -34,6 +34,16 @@ The flow:
 
 Org-specific clients are cached within a request using a dict keyed by org ID inside the factory instance, so multiple operations on the same org within a single request reuse the same clients.
 
+#### Handler and worker factory subclasses
+
+The base `Factory` class is abstract, with an abstract method `_create_queue_backend()` that determines how background jobs are enqueued. Two concrete subclasses specialize the factory for different execution contexts:
+
+- **`HandlerFactory`**: Used in HTTP request handlers. Provides an `ArqQueueBackend` for enqueuing real background jobs, and holds a reference to the `UserInfoStore` for authentication lookups. Constructed per-request in the FastAPI dependency.
+
+- **`WorkerFactory`**: Used in arq worker functions. Provides a `NullQueueBackend` that raises `RuntimeError` on `enqueue()`, preventing workers from accidentally creating recursive job chains. Workers only need status-transition methods on services (e.g., `BuildService.fail()`), never job enqueueing.
+
+This split ensures that worker code cannot accidentally enqueue jobs while still sharing all service-construction logic with handlers.
+
 **Open design question — cross-request client pooling**: Org-specific clients (and their underlying connection pools) could potentially be cached in `ProcessContext` across requests, lazily created and keyed by org ID. This would avoid per-request connection setup overhead for frequently-accessed orgs. Needs exploration around credential rotation, memory, and stale-client concerns.
 
 ### Object store abstraction
@@ -58,6 +68,8 @@ The protocol defines these operations:
 - **Individual operations**: upload object, copy object, move object (to purgatory prefix), delete object, get object metadata, generate presigned URL (for client uploads).
 - **Bulk operations** (critical for performance): batch copy (for edition updates involving 500+ objects), batch move (for purgatory), batch delete (for hard-deleting purgatory contents). Bulk methods accept lists of objects and handle parallelism internally using asyncio semaphores. S3 implementations can additionally leverage S3-specific batch APIs where available.
 - **Listing**: list objects under a key prefix.
+
+The initial implementation includes the subset needed for build uploads: `generate_presigned_upload_url`, `generate_presigned_download_url`, `upload_object`, `download_object`, `delete_object`, and `list_objects`. Copy, move, metadata, and bulk operations will be added when edition updates and lifecycle management are implemented.
 
 ### CDN abstraction
 
@@ -514,7 +526,7 @@ $ docverse upload \
 | `--git-ref`        | `DOCVERSE_GIT_REF`   | current Git HEAD           | Git ref for the build                     |
 | `--dir`            | `DOCVERSE_DIR`       | —                          | Path to the built documentation directory |
 | `--token`          | `DOCVERSE_TOKEN`     | —                          | Gafaelfawr authentication token           |
-| `--base-url`       | `DOCVERSE_BASE_URL`  | `https://docverse.lsst.io` | Docverse API base URL                     |
+| `--base-url`       | `DOCVERSE_API`       | `https://roundtable.lsst.cloud/docverse/api` | Docverse API base URL                     |
 | `--alternate-name` | `DOCVERSE_ALTERNATE` | —                          | Alternate name for scoped editions        |
 | `--no-wait`        |                      | wait enabled               | Return immediately after signaling upload |
 

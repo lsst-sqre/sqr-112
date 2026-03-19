@@ -91,7 +91,13 @@ async def unpack_and_upload(
     build_id: str,
     semaphore: asyncio.Semaphore,
 ) -> list[str]:
-    """Stream-unpack a tarball and upload files to the build prefix."""
+    """Stream-unpack a tarball and upload files to the build prefix.
+
+    Parameters
+    ----------
+    build_id
+        Crockford Base32 public ID of the build (serialized form).
+    """
     tarball_stream = await staging_store.get_object_stream(
         f"__staging/{build_id}.tar.gz"
     )
