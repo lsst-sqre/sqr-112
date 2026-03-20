@@ -22,15 +22,17 @@ Protocol classes defining their interfaces live in the **domain** layer.
 Following the [Ook factory pattern](https://github.com/lsst-sqre/ook/blob/main/src/ook/factory.py), Docverse uses a `Factory` class that is provided as a FastAPI dependency to handlers.
 The factory combines process-level singletons (held in a `ProcessContext`) with a request-scoped database session to construct services and storage clients on demand.
 
-For Docverse's multi-tenant architecture, the factory additionally handles **org-specific client construction**.
+For Docverse's multi-tenant architecture, the factory additionally handles **org-specific client construction** using the three-layer infrastructure model (see {ref}`org-infrastructure`).
 The flow:
 
 1. A handler receives a request scoped to an organization (resolved from URL path or project slug).
 2. The handler gets the `Factory` from FastAPI's dependency injection.
-3. The factory loads the org's configuration from the database.
-4. `factory.create_object_store(org)` inspects the org's provider config and returns the correct implementation (S3 client with that org's bucket/credentials, or a GCS client, etc.).
-5. `factory.create_cdn_client(org)` does the same for the CDN provider.
+3. The factory loads the org's configuration from the database, including its service slot assignments.
+4. `factory.create_object_store(org)` resolves the org's `publishing_store_label` → loads the service's config and credential reference → decrypts the credential → returns the correct implementation (S3 client with that org's bucket/credentials, or a GCS client, etc.).
+5. `factory.create_cdn_client(org)` follows the same pattern via the `cdn_service_label` slot.
 6. `factory.create_edition_service(org)` wires up the org-specific object store, CDN client, and database stores into the edition update service.
+
+Because credentials are separated from service configuration, a single decrypted credential can be reused across multiple services from the same provider within a request (e.g., one Cloudflare API token serving both the R2 object store and Workers CDN).
 
 Org-specific clients are cached within a request using a dict keyed by org ID inside the factory instance, so multiple operations on the same org within a single request reuse the same clients.
 
@@ -54,7 +56,7 @@ A **protocol class** in the domain layer defines the interface that all object s
 - _S3-compatible_: uses `aiobotocore` (async). Covers AWS S3, generic S3-compatible stores (MinIO, etc.), and Cloudflare R2 (which exposes an S3-compatible API).
 - _GCS_: uses `gcloud-aio-storage` (async). GCS's API is distinct enough from S3 to warrant a separate implementation rather than forcing it through an S3-compatibility shim.
 
-A **factory method** in the storage layer (called by the `Factory`) instantiates the correct implementation based on the org's provider configuration.
+A **factory method** in the storage layer (called by the `Factory`) instantiates the correct implementation based on the org's service provider configuration and decrypted credential.
 **Services** only interact with the protocol — they are backend-agnostic.
 
 Cloudflare R2 is accessed via the S3-compatible implementation.

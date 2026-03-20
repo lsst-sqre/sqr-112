@@ -14,14 +14,17 @@ First, **cost allocation** — organizations pay for and control their own cloud
 Second, **data ownership** — organizations retain full ownership of their stored documentation artifacts; Docverse itself only stores connection metadata and encrypted credentials, never the data at rest.
 Third, **regulatory compliance** — some organizations face restrictions such as ITAR export controls that dictate where documentation can be hosted and who can access the underlying storage, requirements that are simplest to satisfy when the organization controls its own accounts.
 
+The {ref}`org-infrastructure` section below describes how organizations configure credentials, services, and slot assignments to connect their cloud resources to Docverse.
+
 ### Organization configuration
 
 Each organization owns:
 
-- **Object store**: bucket name, credentials, provider (AWS S3, GCS, generic S3-compatible, or Cloudflare R2). The bucket is provisioned externally by the org admin; Docverse stores connection details.
-- **Staging store** (optional): a separate object store bucket used for build tarball uploads, configured with the same shape as the publishing object store (provider, bucket, credentials). When configured, presigned upload URLs point to the staging bucket and the Docverse worker reads tarballs from it. When not configured, staging uses a `__staging/` prefix in the publishing bucket. The staging store optimization is useful when the publishing store is on a different network than the Docverse compute cluster -- for example, a GCS staging bucket in the same region as a GKE cluster paired with a Cloudflare R2 publishing bucket. The staging bucket only needs transient storage; tarballs are deleted after processing.
-- **CDN**: provider choice (Fastly, Cloudflare Workers, Google Cloud CDN), service ID, API keys for cache purging. The CDN is provisioned externally; Docverse only interacts at runtime for cache invalidation and edge data store updates.
-- **DNS**: For subdomain-based layouts, Docverse registers subdomains via DNS APIs (e.g., Route 53, Cloudflare DNS). When using Cloudflare, wildcard subdomains are supported on all plans via a proxied `*.domain` DNS record with free wildcard SSL.
+- **Infrastructure services** (credentials, services, and slot assignments — see {ref}`org-infrastructure` below):
+  - _Publishing store_: object store bucket where published documentation is served from.
+  - _Staging store_ (optional): separate object store bucket for build tarball uploads. When configured, presigned upload URLs point to the staging bucket and the Docverse worker reads tarballs from it. When not configured, staging uses a `__staging/` prefix in the publishing bucket. The staging store optimization is useful when the publishing store is on a different network than the Docverse compute cluster — for example, a GCS staging bucket in the same region as a GKE cluster paired with a Cloudflare R2 publishing bucket. The staging bucket only needs transient storage; tarballs are deleted after processing.
+  - _CDN_ (optional): cache purging and edge data store updates. The CDN is provisioned externally; Docverse only interacts at runtime. Organizations that self-host or use a custom serving layer leave this slot empty.
+  - _DNS_ (optional): for subdomain-based layouts, Docverse registers subdomains via DNS APIs. When using Cloudflare, wildcard subdomains are supported on all plans via a proxied `*.domain` DNS record with free wildcard SSL. Organizations that manage DNS externally leave this slot empty.
 - **URL scheme** (per-org setting, one of):
   - _Subdomain_: each project gets `project.base-domain` (e.g., `sqr-006.lsst.io`)
   - _Path-prefix_: all projects under a root path (e.g., `example.com/documentation/project`)
@@ -30,11 +33,174 @@ Each organization owns:
 - **Edition slug rewrite rules**: an ordered list of rules that transform git refs into edition slugs. Configured at the org level with optional per-project overrides. See the {ref}`edition-slug-rewrite-rules` section for the full rule format.
 - **Default edition lifecycle rules** ({ref}`projects`).
 
-### Credential storage
+(org-infrastructure)=
 
-Docverse encrypts organization credentials at rest using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. Fernet provides AES-128-CBC encryption with HMAC-SHA256 authentication — ciphertext is tamper-evident and self-describing (the token embeds a timestamp and version byte). Encryption and decryption are in-process CPU-bound operations (sub-millisecond), requiring no external service calls or network round-trips. A single Fernet key is stored as a Kubernetes secret, never in the database, so database backups alone cannot decrypt credentials.
+### Infrastructure service model
+
+Docverse follows a "bring your own infrastructure" strategy: each organization provisions and owns its cloud resources (object store buckets, CDN services, DNS zones).
+Docverse stores only connection metadata and encrypted credentials, never the documentation data itself.
+
+Infrastructure configuration uses a three-layer model that separates authentication from service configuration and role assignment:
+
+1. **Credentials** — provider-level authentication (e.g., one AWS credential, one Cloudflare API token). A single credential can be shared across multiple services from the same provider.
+2. **Services** — infrastructure configurations that pair non-secret config (bucket name, account ID, zone ID) with a reference to a credential. Each service has a category (`object_storage`, `cdn`, or `dns`) and a provider-specific configuration schema.
+3. **Slot assignments** — the organization references services by label for specific roles: `publishing_store`, `staging_store`, `cdn_service`, and `dns_service`.
+
+This separation provides several benefits:
+- **Credential deduplication**: one Cloudflare API token serves R2, Workers, and DNS services simultaneously.
+- **Rotate once**: updating a credential automatically applies to all services that reference it.
+- **Visible configuration**: GET responses on services show non-secret config (bucket name, account ID, region) while secrets remain encrypted and write-only.
+- **Flexible composition**: organizations can mix providers (e.g., AWS S3 + Fastly CDN) or go all-in on one (e.g., Cloudflare for everything). Organizations that manage CDN or DNS externally simply leave those slots unassigned.
+
+#### Credential providers
+
+Each credential stores the authentication secrets for a single cloud provider.
+The credential's `provider` field determines the schema of the encrypted payload:
+
+| Provider      | Encrypted fields                        | Used by service providers                     |
+| ------------- | --------------------------------------- | --------------------------------------------- |
+| `aws`         | `access_key_id`, `secret_access_key`    | `aws_s3`, `cloudfront`, `route53`             |
+| `cloudflare`  | `api_token`                             | `cloudflare_r2`, `cloudflare_workers`, `cloudflare_dns` |
+| `fastly`      | `api_token`                             | `fastly`                                      |
+| `gcp`         | `service_account_json`                  | `gcs`, `google_cloud_cdn`                     |
+
+Credentials are created via `POST /orgs/:org/credentials` and are **write-only** — the GET response returns metadata (label, provider, timestamps) but never the decrypted secrets.
+
+#### Service providers
+
+Each service combines non-secret configuration with a reference to a credential.
+The service's `provider` field determines the config schema and which credential providers are compatible:
+
+**Object storage providers:**
+
+| Provider         | Config fields                  | Compatible credential | Notes |
+| ---------------- | ------------------------------ | --------------------- | ----- |
+| `aws_s3`         | `bucket`, `region`             | `aws`                 | Native AWS S3 |
+| `cloudflare_r2`  | `account_id`, `bucket`         | `cloudflare`          | S3-compatible API, zero egress |
+| `minio`          | `endpoint_url`, `bucket`       | `aws`                 | S3-compatible API |
+| `gcs`            | `bucket`, `project_id`         | `gcp`                 | Google Cloud Storage |
+
+**CDN providers:**
+
+| Provider              | Config fields               | Compatible credential | Notes |
+| --------------------- | --------------------------- | --------------------- | ----- |
+| `fastly`              | `service_id`                | `fastly`              | Surrogate-key purge, KV Store |
+| `cloudflare_workers`  | `account_id`, `zone_id`     | `cloudflare`          | Edge compute + Workers KV |
+| `cloudfront`          | `distribution_id`           | `aws`                 | Lambda@Edge, no pointer mode |
+| `google_cloud_cdn`    | `backend_service`           | `gcp`                 | Copy mode only |
+
+**DNS providers:**
+
+| Provider         | Config fields       | Compatible credential |
+| ---------------- | ------------------- | --------------------- |
+| `route53`        | `hosted_zone_id`    | `aws`                 |
+| `cloudflare_dns` | `zone_id`           | `cloudflare`          |
+
+Services are created via `POST /orgs/:org/services` and managed at `GET/DELETE /orgs/:org/services/:label`.
+Unlike credentials, the non-secret `config` fields **are** returned in GET responses, so administrators can verify bucket names, account IDs, and other infrastructure details without needing to inspect the cloud provider directly.
+
+#### Slot assignments
+
+The organization model has four service slots that reference services by label:
+
+| Slot                | Required category | Purpose |
+| ------------------- | ----------------- | ------- |
+| `publishing_store`  | `object_storage`  | Bucket where published documentation is served from |
+| `staging_store`     | `object_storage`  | Bucket for build tarball uploads (optional) |
+| `cdn_service`       | `cdn`             | Cache purging and edge data store updates (optional) |
+| `dns_service`       | `dns`             | Subdomain registration (optional) |
+
+Slots are assigned via `PATCH /orgs/:org` using `_label` suffixed fields (e.g., `publishing_store_label`).
+In GET responses, slots are returned as embedded service summaries (label, category, provider, and a HATEOAS URL to the full service detail) rather than bare labels.
+
+#### Example: all-Cloudflare setup
+
+```json
+// 1. Create one credential for all Cloudflare services
+// POST /orgs/rubin/credentials
+{
+    "label": "cloudflare",
+    "credentials": {
+        "provider": "cloudflare",
+        "api_token": "cf-token-xxx"
+    }
+}
+
+// 2. Create services referencing the same credential
+// POST /orgs/rubin/services
+{
+    "label": "docs-bucket",
+    "config": {
+        "provider": "cloudflare_r2",
+        "account_id": "abc123",
+        "bucket": "rubin-docs"
+    },
+    "credential_label": "cloudflare"
+}
+
+// POST /orgs/rubin/services
+{
+    "label": "staging-bucket",
+    "config": {
+        "provider": "cloudflare_r2",
+        "account_id": "abc123",
+        "bucket": "rubin-docs-staging"
+    },
+    "credential_label": "cloudflare"
+}
+
+// POST /orgs/rubin/services
+{
+    "label": "cdn",
+    "config": {
+        "provider": "cloudflare_workers",
+        "account_id": "abc123",
+        "zone_id": "xyz789"
+    },
+    "credential_label": "cloudflare"
+}
+
+// 3. Assign services to org slots
+// PATCH /orgs/rubin
+{
+    "publishing_store_label": "docs-bucket",
+    "staging_store_label": "staging-bucket",
+    "cdn_service_label": "cdn"
+}
+```
+
+#### Example: AWS + Fastly setup
+
+```json
+// Two credentials
+// POST /orgs/spherex/credentials
+{ "label": "aws", "credentials": { "provider": "aws", "access_key_id": "...", "secret_access_key": "..." } }
+
+// POST /orgs/spherex/credentials
+{ "label": "fastly", "credentials": { "provider": "fastly", "api_token": "..." } }
+
+// Three services
+// POST /orgs/spherex/services
+{ "label": "s3-publish", "config": { "provider": "aws_s3", "bucket": "spherex-docs", "region": "us-east-1" }, "credential_label": "aws" }
+
+// POST /orgs/spherex/services
+{ "label": "fastly-cdn", "config": { "provider": "fastly", "service_id": "svc123" }, "credential_label": "fastly" }
+
+// POST /orgs/spherex/services
+{ "label": "dns", "config": { "provider": "route53", "hosted_zone_id": "Z1234" }, "credential_label": "aws" }
+
+// PATCH /orgs/spherex
+{ "publishing_store_label": "s3-publish", "cdn_service_label": "fastly-cdn", "dns_service_label": "dns" }
+```
+
+### Credential encryption
+
+Docverse encrypts credential secrets at rest using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. Fernet provides AES-128-CBC encryption with HMAC-SHA256 authentication — ciphertext is tamper-evident and self-describing (the token embeds a timestamp and version byte). Encryption and decryption are in-process CPU-bound operations (sub-millisecond), requiring no external service calls or network round-trips. A single Fernet key is stored as a Kubernetes secret, never in the database, so database backups alone cannot decrypt credentials.
 
 This approach avoids the operational complexity of Vault Transit (running a Vault instance, configuring Kubernetes auth, managing Vault policies, network round-trips for every encrypt/decrypt) for what amounts to encrypting a small number of short API tokens and keys. The `cryptography` library is already a transitive dependency via Safir.
+
+Only the `encrypted_credentials` column in the `organization_credentials` table ({ref}`table-organization-credentials`) contains encrypted data.
+Service configuration (bucket names, account IDs, zone IDs) in the `organization_services` table ({ref}`table-organization-services`) is stored as plaintext JSONB, since this information is non-secret and returned in API responses.
 
 #### Key provisioning
 
@@ -58,25 +224,6 @@ At startup, the application loads the encryption key from environment variables 
 - `DOCVERSE_CREDENTIAL_ENCRYPTION_KEY_RETIRED` (optional) — a retired key, present only during rotation periods.
 
 When both keys are present, Docverse constructs a `MultiFernet([Fernet(primary), Fernet(retired)])`. `MultiFernet` tries decryption with each key in order, so credentials encrypted under either key are readable, while new encryptions always use the primary key. When only the primary key is present, Docverse still wraps it in `MultiFernet([Fernet(primary)])` to provide a uniform interface.
-
-#### Database schema
-
-The implementation stores raw Fernet token bytes (not base64-encoded text). Fernet tokens are self-describing (they embed a version byte, timestamp, IV, and HMAC), so the database schema needs no separate columns for nonces, key versions, or algorithm metadata:
-
-```sql
-CREATE TABLE organization_credentials (
-    id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
-    organization_id INTEGER NOT NULL REFERENCES organizations(id),
-    label TEXT NOT NULL,
-    service_type TEXT NOT NULL,
-    encrypted_credential BYTEA NOT NULL,
-    date_created TIMESTAMPTZ NOT NULL DEFAULT now(),
-    date_updated TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE(organization_id, label)
-);
-```
-
-The `label` is a human-friendly name (e.g., "Cloudflare R2 production"). The `service_type` identifies the provider (e.g., `s3`, `r2`, `minio`). The `s3` type covers AWS S3 and generic S3-compatible services; `r2` covers Cloudflare R2; `minio` covers MinIO deployments. Credentials are write-only through the API — the GET response returns metadata (label, service type, timestamps) but never the decrypted value. See {ref}`dbschema` for all database tables and {ref}`table-organization-credentials` for the column reference.
 
 #### Python integration
 

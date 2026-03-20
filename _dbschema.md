@@ -13,6 +13,8 @@ erDiagram
     Organization ||--o{ Project : "has"
     Organization ||--o{ OrgMembership : "has"
     Organization ||--o{ organization_credentials : "has"
+    Organization ||--o{ organization_services : "has"
+    organization_services }o--|| organization_credentials : "uses"
     Organization ||--o{ DashboardTemplate : "has"
     Organization ||--o{ QueueJob : "scoped to"
     Project ||--o{ Build : "has"
@@ -34,6 +36,10 @@ erDiagram
         string root_path_prefix
         JSONB slug_rewrite_rules
         JSONB lifecycle_rules
+        string publishing_store_label
+        string staging_store_label
+        string cdn_service_label
+        string dns_service_label
         datetime date_created
         datetime date_updated
     }
@@ -97,10 +103,22 @@ erDiagram
         int id PK
         int organization_id FK
         string label
-        string service_type
-        string encrypted_credential
-        datetime created_at
-        datetime updated_at
+        string provider
+        bytea encrypted_credentials
+        datetime date_created
+        datetime date_updated
+    }
+
+    organization_services {
+        int id PK
+        int organization_id FK
+        string label
+        string category
+        string provider
+        JSONB config
+        string credential_label
+        datetime date_created
+        datetime date_updated
     }
 
     BuildObject {
@@ -163,20 +181,24 @@ The organization is the top-level resource and the sole infrastructure configura
 All projects within an org share the same object store, CDN, root domain, URL scheme, and default dashboard templates.
 See {ref}`organizations` for the full behavioral design.
 
-| Column               | Type              | Description |
-| -------------------- | ----------------- | ----------- |
-| `id`                 | int               | Primary key |
-| `slug`               | str (unique)      | URL-safe identifier (e.g., `rubin`, `spherex`) |
-| `title`              | str               | Human-readable name |
-| `base_domain`        | str               | Root domain for published URLs (e.g., `lsst.io`) |
-| `url_scheme`         | enum              | `subdomain` or `path_prefix` — determines how project URLs are constructed |
-| `root_path_prefix`   | str               | Path prefix for path-prefix URL scheme (e.g., `/documentation/`) |
-| `slug_rewrite_rules` | JSONB             | Ordered list of edition slug rewrite rules (see {ref}`edition-slug-rewrite-rules`) |
-| `lifecycle_rules`    | JSONB             | Default lifecycle rules for projects in this org (see {ref}`projects`) |
-| `date_created`       | datetime          | Creation timestamp |
-| `date_updated`       | datetime          | Last modification timestamp |
+| Column                  | Type              | Description |
+| ----------------------- | ----------------- | ----------- |
+| `id`                    | int               | Primary key |
+| `slug`                  | str (unique)      | URL-safe identifier (e.g., `rubin`, `spherex`) |
+| `title`                 | str               | Human-readable name |
+| `base_domain`           | str               | Root domain for published URLs (e.g., `lsst.io`) |
+| `url_scheme`            | enum              | `subdomain` or `path_prefix` — determines how project URLs are constructed |
+| `root_path_prefix`      | str               | Path prefix for path-prefix URL scheme (e.g., `/documentation/`) |
+| `slug_rewrite_rules`    | JSONB             | Ordered list of edition slug rewrite rules (see {ref}`edition-slug-rewrite-rules`) |
+| `lifecycle_rules`       | JSONB             | Default lifecycle rules for projects in this org (see {ref}`projects`) |
+| `publishing_store_label` | str (nullable)   | Label of the `object_storage` service used as the publishing store |
+| `staging_store_label`   | str (nullable)    | Label of the `object_storage` service used for staging uploads |
+| `cdn_service_label`     | str (nullable)    | Label of the `cdn` service used for cache purging and edge data |
+| `dns_service_label`     | str (nullable)    | Label of the `dns` service used for subdomain registration |
+| `date_created`          | datetime          | Creation timestamp |
+| `date_updated`          | datetime          | Last modification timestamp |
 
-Infrastructure connections (object store, CDN, DNS, staging store) are configured through the {ref}`table-organization-credentials` table and additional org-level configuration fields.
+Infrastructure connections are configured through the three-layer model described in {ref}`org-infrastructure`: credentials ({ref}`table-organization-credentials`), services ({ref}`table-organization-services`), and slot assignments (the `_label` columns above).
 
 (table-project)=
 
@@ -276,20 +298,46 @@ See {ref}`auth` for the full authorization model, role definitions, and resoluti
 
 #### organization_credentials
 
-Stores Fernet-encrypted credentials for organization infrastructure services (object stores, CDNs, DNS providers).
-See {ref}`organizations` for the encryption scheme, key rotation, and credential management.
+Stores Fernet-encrypted authentication secrets for cloud providers.
+Each credential represents a single provider's authentication (e.g., one AWS access key pair, one Cloudflare API token).
+A credential can be shared across multiple services from the same provider.
+See {ref}`organizations` for the encryption scheme, key rotation, and the three-layer infrastructure model.
 
-| Column                 | Type              | Description |
-| ---------------------- | ----------------- | ----------- |
-| `id`                   | int               | Auto-increment primary key |
-| `organization_id`      | FK → Organization | Owning organization |
-| `label`                | str               | Human-friendly name (e.g., "Cloudflare R2 production") |
-| `service_type`         | str               | Provider identifier (e.g., `cloudflare`, `aws_s3`, `fastly`) |
-| `encrypted_credential` | str               | Fernet token containing the encrypted credential value |
-| `created_at`           | datetime          | Creation timestamp |
-| `updated_at`           | datetime          | Last modification timestamp |
+| Column                  | Type              | Description |
+| ----------------------- | ----------------- | ----------- |
+| `id`                    | int               | Auto-increment primary key |
+| `organization_id`       | FK → Organization | Owning organization |
+| `label`                 | str               | Human-friendly name (e.g., `cloudflare`, `aws-prod`) |
+| `provider`              | str               | Cloud provider identifier: `aws`, `cloudflare`, `fastly`, or `gcp` |
+| `encrypted_credentials` | bytea             | Fernet token containing the encrypted credential payload (JSON-encoded) |
+| `date_created`          | datetime          | Creation timestamp |
+| `date_updated`          | datetime          | Last modification timestamp |
 
 Unique constraint on `(organization_id, label)`.
+
+(table-organization-services)=
+
+#### organization_services
+
+Stores non-secret infrastructure configuration for organization services.
+Each service pairs a configuration (bucket name, account ID, etc.) with a reference to a credential from {ref}`table-organization-credentials`.
+The `config` column is plaintext JSONB and is returned in API responses, unlike credentials which are write-only.
+See {ref}`org-infrastructure` for the full service provider catalog and examples.
+
+| Column             | Type              | Description |
+| ------------------ | ----------------- | ----------- |
+| `id`               | int               | Auto-increment primary key |
+| `organization_id`  | FK → Organization | Owning organization |
+| `label`            | str               | Human-friendly name (e.g., `docs-bucket`, `cdn`, `dns`) |
+| `category`         | str               | Service category: `object_storage`, `cdn`, or `dns` |
+| `provider`         | str               | Service provider (e.g., `aws_s3`, `cloudflare_r2`, `fastly`, `cloudflare_workers`, `route53`, `cloudflare_dns`) |
+| `config`           | JSONB             | Provider-specific non-secret configuration (bucket name, account ID, zone ID, etc.) |
+| `credential_label` | str               | Label of the credential in `organization_credentials` that this service uses for authentication |
+| `date_created`     | datetime          | Creation timestamp |
+| `date_updated`     | datetime          | Last modification timestamp |
+
+Unique constraint on `(organization_id, label)`.
+The `category` is derivable from `provider` but stored explicitly for query convenience (e.g., "list all object_storage services for this org").
 
 (table-build-object)=
 
