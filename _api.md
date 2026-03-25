@@ -37,14 +37,13 @@ Build and queue job IDs use the [Crockford Base32 implementation from Ook](https
 
 ### Ingress and authorization mapping
 
-Two Gafaelfawr ingresses protect the API:
+A single Gafaelfawr ingress protects the API:
 
-| Ingress path | Required scope        | Purpose                                    |
-| ------------ | --------------------- | ------------------------------------------ |
-| `/admin/*`   | `admin:docverse`      | Superadmin operations (create/delete orgs) |
-| `/*`         | `exec:docverse`       | All other operations                       |
+| Ingress path | Required scope  | Purpose                    |
+| ------------ | --------------- | -------------------------- |
+| `/*`         | `exec:docverse` | All Docverse API routes    |
 
-All org-level authorization (admin vs uploader vs reader) is enforced at the **application layer** via `OrgMembership` checks. Gafaelfawr ingresses cannot express "user X has role Y in org Z" — that granularity requires application-level logic. The ingress layer ensures the user is authenticated and has basic Docverse access; the application layer checks the specific role required for each endpoint.
+`/admin/*` routes are accessible at the ingress level but restricted to superadmin users (determined by `superadmin_usernames` configuration) at the application layer. All org-level authorization (admin vs uploader vs reader) is also enforced at the **application layer** via `OrgMembership` checks. Gafaelfawr ingresses cannot express "user X has role Y in org Z" — that granularity requires application-level logic. The ingress layer ensures the user is authenticated and has basic Docverse access; the application layer checks the specific role required for each endpoint.
 
 ### Endpoint catalog
 
@@ -58,12 +57,18 @@ Returns API version, available org URLs, and links to documentation. No authenti
 
 #### Superadmin — organization management
 
-These endpoints are separated under `/admin/` to enable the `admin:docverse` Gafaelfawr scope at the ingress level.
+These endpoints are separated under `/admin/` for organizational clarity. Access is restricted to superadmin users (determined by `superadmin_usernames` configuration) at the application layer.
 
 ```
-POST   /admin/orgs                                  → create organization
+GET    /admin/orgs                                   → list all organizations
+POST   /admin/orgs                                   → create organization
+GET    /admin/orgs/:org                              → get organization
 DELETE /admin/orgs/:org                              → delete organization
 ```
+
+The `POST /admin/orgs` request body accepts an optional `members` array of `OrgMembershipCreate` objects, allowing the superadmin to seed initial org membership in a single request.
+
+Admin organization responses include an `org_url` field linking to the org-scoped `GET /orgs/:org` endpoint, enabling HATEOAS cross-navigation between admin and org-scoped views.
 
 #### Organizations
 

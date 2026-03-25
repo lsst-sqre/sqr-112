@@ -61,6 +61,10 @@ sequenceDiagram
    6. **Update editions** in parallel via `asyncio.gather()`.
    7. **Render project dashboard and metadata JSON** once after all edition updates.
 
+:::{note}
+The initial implementation covers steps 1–4 (download, unpack, upload, and inventory). Edition tracking evaluation (step 5), edition updates (step 6), and dashboard rendering (step 7) are planned for subsequent development phases. The initial inventory implementation stores aggregate metrics (`object_count`, `total_size_bytes`) on the build record rather than per-object rows in the `BuildObject` table.
+:::
+
 The API handler for step 4 is thin: it validates the request, updates the build status to `processing`, enqueues the background job, and returns the `queue_url`.
 
 #### Staging location
@@ -132,6 +136,10 @@ async def unpack_and_upload(
 ```
 
 The semaphore bounds concurrency (e.g., 50 concurrent uploads) to avoid overwhelming the object store API. Content types are inferred from file extensions.
+
+:::{note}
+The code example above shows separate `staging_store` and `publishing_store` parameters for clarity. The initial implementation uses a single `object_store` resolved from `org.resolved_staging_store_label`, which falls back to the publishing store when no dedicated staging store is configured. Both the staging read and publishing write use this single store.
+:::
 
 The choice of tar.gz over ZIP is deliberate. Tar archives are designed for sequential streaming (originally tape I/O), and each entry header includes the file size upfront, so the worker can stream each file directly into an object store upload without buffering. Gzip compresses the archive as a single stream, which yields better compression ratios for documentation sites whose HTML, CSS, and JavaScript files share significant redundancy — ZIP, by contrast, compresses each file independently and cannot exploit cross-file similarity. ZIP's main advantage is random access via its central directory, but that is irrelevant here since the worker extracts every file sequentially.
 

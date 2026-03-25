@@ -279,7 +279,7 @@ Key rotation uses `MultiFernet` to provide a zero-downtime transition:
 
 Organizations are created and configured via the Docverse API (not statically in Helm/Phalanx config). This keeps orgs in the same database as projects for consistency. The API has two tiers of admin endpoints:
 
-- **Docverse superadmin APIs**: create/delete/list organizations (scoped via Gafaelfawr token scope)
+- **Docverse superadmin APIs**: create/delete/list organizations (scoped via `superadmin_usernames` configuration)
 - **Org admin APIs**: configure the org's settings, manage projects, manage edition rules
 
 ### Dashboard rendering
