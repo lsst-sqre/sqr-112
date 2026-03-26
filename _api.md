@@ -160,6 +160,7 @@ A credential cannot be deleted while any service references it.
 GET    /orgs/:org/services                             → list services (admin)
 POST   /orgs/:org/services                             → create service (admin)
 GET    /orgs/:org/services/:label                      → get service detail (admin)
+PATCH  /orgs/:org/services/:label                      → update service (admin)
 DELETE /orgs/:org/services/:label                      → delete service (admin)
 ```
 
@@ -167,6 +168,9 @@ Services combine non-secret infrastructure configuration with a credential refer
 The `POST` request includes `label`, a `config` object (whose schema depends on the `provider` field), and `credential_label` (referencing an existing credential).
 At creation time, Docverse validates that the credential exists and that its `provider` is compatible with the service's provider (see {ref}`org-infrastructure` for the compatibility matrix).
 `GET` responses include the full non-secret `config` (bucket name, account ID, etc.).
+`PATCH` accepts a partial update body.
+Currently supports `credential_label` to reassign the service to a different credential.
+Docverse validates that the new credential exists and that its provider is compatible with the service's provider.
 A service cannot be deleted while any organization slot references it.
 
 The `GET /orgs/:org/services/:label` response:
