@@ -22,17 +22,29 @@ Protocol classes defining their interfaces live in the **domain** layer.
 Following the [Ook factory pattern](https://github.com/lsst-sqre/ook/blob/main/src/ook/factory.py), Docverse uses a `Factory` class that is provided as a FastAPI dependency to handlers.
 The factory combines process-level singletons (held in a `ProcessContext`) with a request-scoped database session to construct services and storage clients on demand.
 
-For Docverse's multi-tenant architecture, the factory additionally handles **org-specific client construction**.
+For Docverse's multi-tenant architecture, the factory additionally handles **org-specific client construction** using the three-layer infrastructure model (see {ref}`org-infrastructure`).
 The flow:
 
 1. A handler receives a request scoped to an organization (resolved from URL path or project slug).
 2. The handler gets the `Factory` from FastAPI's dependency injection.
-3. The factory loads the org's configuration from the database.
-4. `factory.create_object_store(org)` inspects the org's provider config and returns the correct implementation (S3 client with that org's bucket/credentials, or a GCS client, etc.).
-5. `factory.create_cdn_client(org)` does the same for the CDN provider.
+3. The factory loads the org's configuration from the database, including its service slot assignments.
+4. `factory.create_object_store(org)` resolves the org's `publishing_store_label` → loads the service's config and credential reference → decrypts the credential → returns the correct implementation (S3 client with that org's bucket/credentials, or a GCS client, etc.).
+5. `factory.create_cdn_client(org)` follows the same pattern via the `cdn_service_label` slot.
 6. `factory.create_edition_service(org)` wires up the org-specific object store, CDN client, and database stores into the edition update service.
 
+Because credentials are separated from service configuration, a single decrypted credential can be reused across multiple services from the same provider within a request (e.g., one Cloudflare API token serving both the R2 object store and Workers CDN).
+
 Org-specific clients are cached within a request using a dict keyed by org ID inside the factory instance, so multiple operations on the same org within a single request reuse the same clients.
+
+#### Handler and worker factory subclasses
+
+The base `Factory` class is abstract, with an abstract method `_create_queue_backend()` that determines how background jobs are enqueued. Two concrete subclasses specialize the factory for different execution contexts:
+
+- **`HandlerFactory`**: Used in HTTP request handlers. Provides an `ArqQueueBackend` for enqueuing real background jobs, and holds a reference to the `UserInfoStore` for authentication lookups. Constructed per-request in the FastAPI dependency.
+
+- **`WorkerFactory`**: Used in arq worker functions. Provides a `NullQueueBackend` that raises `RuntimeError` on `enqueue()`, preventing workers from accidentally creating recursive job chains. Workers only need status-transition methods on services (e.g., `BuildService.fail()`), never job enqueueing.
+
+This split ensures that worker code cannot accidentally enqueue jobs while still sharing all service-construction logic with handlers.
 
 **Open design question — cross-request client pooling**: Org-specific clients (and their underlying connection pools) could potentially be cached in `ProcessContext` across requests, lazily created and keyed by org ID. This would avoid per-request connection setup overhead for frequently-accessed orgs. Needs exploration around credential rotation, memory, and stale-client concerns.
 
@@ -44,12 +56,20 @@ A **protocol class** in the domain layer defines the interface that all object s
 - _S3-compatible_: uses `aiobotocore` (async). Covers AWS S3, generic S3-compatible stores (MinIO, etc.), and Cloudflare R2 (which exposes an S3-compatible API).
 - _GCS_: uses `gcloud-aio-storage` (async). GCS's API is distinct enough from S3 to warrant a separate implementation rather than forcing it through an S3-compatibility shim.
 
-A **factory method** in the storage layer (called by the `Factory`) instantiates the correct implementation based on the org's provider configuration.
+A **factory method** in the storage layer (called by the `Factory`) instantiates the correct implementation based on the org's service provider configuration and decrypted credential.
 **Services** only interact with the protocol — they are backend-agnostic.
 
 Cloudflare R2 is accessed via the S3-compatible implementation.
 R2's S3 API compatibility is comprehensive enough that a dedicated implementation is not required.
 The key difference is R2's zero egress fees, which is a cost consideration rather than an API difference.
+
+#### R2 compatibility notes
+
+The S3-compatible implementation includes several configuration choices for Cloudflare R2 compatibility:
+
+- **Signature version**: The `botocore.Config` forces `signature_version="s3v4"` (AWS Signature Version 4), which R2 requires.
+- **Checksum handling**: `request_checksum_calculation="when_required"` and `response_checksum_validation="when_required"` disable the trailing checksum behavior introduced in recent AWS SDK versions, which R2 does not support.
+- **Presigned URL uploads**: The worker's `upload_object` method uses a two-step presigned URL approach: it generates a presigned PUT URL via `generate_presigned_url`, then uploads the data via httpx `PUT` to that URL. This avoids checksum signing issues with R2's `put_object` API. The `S3ObjectStore` accepts an optional `httpx.AsyncClient` — when provided (by the worker), uploads use presigned URLs; when absent (in handler contexts that only generate presigned URLs for clients), direct `put_object` is available as a fallback.
 
 #### Object store interface
 
@@ -58,6 +78,8 @@ The protocol defines these operations:
 - **Individual operations**: upload object, copy object, move object (to purgatory prefix), delete object, get object metadata, generate presigned URL (for client uploads).
 - **Bulk operations** (critical for performance): batch copy (for edition updates involving 500+ objects), batch move (for purgatory), batch delete (for hard-deleting purgatory contents). Bulk methods accept lists of objects and handle parallelism internally using asyncio semaphores. S3 implementations can additionally leverage S3-specific batch APIs where available.
 - **Listing**: list objects under a key prefix.
+
+The initial implementation includes the subset needed for build uploads: `generate_presigned_upload_url`, `generate_presigned_download_url`, `upload_object`, `download_object`, `delete_object`, and `list_objects`. Copy, move, metadata, and bulk operations will be added when edition updates and lifecycle management are implemented.
 
 ### CDN abstraction
 
@@ -130,8 +152,16 @@ docverse/                           # lsst-sqre/docverse
 │               ├── __init__.py
 │               ├── _client.py      # DocverseClient
 │               ├── _cli.py         # CLI entry point
-│               ├── _models.py      # Pydantic request/response models
-│               └── _tar.py         # Tarball creation utility
+│               ├── _exceptions.py  # Client exception types
+│               ├── _tar.py         # Tarball creation utility
+│               └── models/         # Pydantic request/response models
+│                   ├── __init__.py
+│                   ├── builds.py
+│                   ├── credentials.py
+│                   ├── infrastructure.py
+│                   ├── organizations.py
+│                   ├── services.py
+│                   └── ...
 ├── src/
 │   └── docverse/
 │       ├── ...
@@ -370,7 +400,7 @@ The client package owns every Pydantic model that appears in API request and res
 The server imports these models and can subclass them to add server-side concerns (database constructors, internal validators), but the wire format is always defined in the client.
 
 ```{code-block} python
-:caption: docverse/client/_models.py
+:caption: docverse/client/models/builds.py
 
 from pydantic import BaseModel, HttpUrl
 
@@ -396,7 +426,7 @@ class BuildResponse(BaseModel):
 ```{code-block} python
 :caption: docverse/models/build.py
 
-from docverse.client._models import BuildCreate as ClientBuildCreate
+from docverse.client.models import BuildCreate as ClientBuildCreate
 from ..db import Build as BuildRow
 
 class BuildCreate(ClientBuildCreate):
@@ -514,9 +544,10 @@ $ docverse upload \
 | `--git-ref`        | `DOCVERSE_GIT_REF`   | current Git HEAD           | Git ref for the build                     |
 | `--dir`            | `DOCVERSE_DIR`       | —                          | Path to the built documentation directory |
 | `--token`          | `DOCVERSE_TOKEN`     | —                          | Gafaelfawr authentication token           |
-| `--base-url`       | `DOCVERSE_BASE_URL`  | `https://docverse.lsst.io` | Docverse API base URL                     |
+| `--base-url`       | `DOCVERSE_API`       | `https://roundtable.lsst.cloud/docverse/api` | Docverse API base URL                     |
 | `--alternate-name` | `DOCVERSE_ALTERNATE` | —                          | Alternate name for scoped editions        |
 | `--no-wait`        |                      | wait enabled               | Return immediately after signaling upload |
+| `--verbose` / `-v` |                      | disabled                   | Show detailed HTTP request/response info  |
 
 #### Exit codes
 

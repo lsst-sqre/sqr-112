@@ -37,14 +37,13 @@ Build and queue job IDs use the [Crockford Base32 implementation from Ook](https
 
 ### Ingress and authorization mapping
 
-Two Gafaelfawr ingresses protect the API:
+A single Gafaelfawr ingress protects the API:
 
-| Ingress path | Required scope        | Purpose                                    |
-| ------------ | --------------------- | ------------------------------------------ |
-| `/admin/*`   | `admin:docverse`      | Superadmin operations (create/delete orgs) |
-| `/*`         | `exec:docverse`       | All other operations                       |
+| Ingress path | Required scope  | Purpose                    |
+| ------------ | --------------- | -------------------------- |
+| `/*`         | `exec:docverse` | All Docverse API routes    |
 
-All org-level authorization (admin vs uploader vs reader) is enforced at the **application layer** via `OrgMembership` checks. Gafaelfawr ingresses cannot express "user X has role Y in org Z" — that granularity requires application-level logic. The ingress layer ensures the user is authenticated and has basic Docverse access; the application layer checks the specific role required for each endpoint.
+`/admin/*` routes are accessible at the ingress level but restricted to superadmin users (determined by `superadmin_usernames` configuration) at the application layer. All org-level authorization (admin vs uploader vs reader) is also enforced at the **application layer** via `OrgMembership` checks. Gafaelfawr ingresses cannot express "user X has role Y in org Z" — that granularity requires application-level logic. The ingress layer ensures the user is authenticated and has basic Docverse access; the application layer checks the specific role required for each endpoint.
 
 ### Endpoint catalog
 
@@ -58,12 +57,18 @@ Returns API version, available org URLs, and links to documentation. No authenti
 
 #### Superadmin — organization management
 
-These endpoints are separated under `/admin/` to enable the `admin:docverse` Gafaelfawr scope at the ingress level.
+These endpoints are separated under `/admin/` for organizational clarity. Access is restricted to superadmin users (determined by `superadmin_usernames` configuration) at the application layer.
 
 ```
-POST   /admin/orgs                                  → create organization
+GET    /admin/orgs                                   → list all organizations
+POST   /admin/orgs                                   → create organization
+GET    /admin/orgs/:org                              → get organization
 DELETE /admin/orgs/:org                              → delete organization
 ```
+
+The `POST /admin/orgs` request body accepts an optional `members` array of `OrgMembershipCreate` objects, allowing the superadmin to seed initial org membership in a single request.
+
+Admin organization responses include an `org_url` field linking to the org-scoped `GET /orgs/:org` endpoint, enabling HATEOAS cross-navigation between admin and org-scoped views.
 
 #### Organizations
 
@@ -73,21 +78,48 @@ GET    /orgs/:org                                    → get organization (reade
 PATCH  /orgs/:org                                    → update org settings (admin)
 ```
 
-The `GET /orgs/:org` response includes navigation URLs and the slug rewrite rules:
+The `GET /orgs/:org` response includes navigation URLs, infrastructure service slot assignments as embedded summaries, and the slug rewrite rules:
 
 ```json
 {
   "self_url": "https://docverse.../orgs/rubin",
+  "services_url": "https://docverse.../orgs/rubin/services",
+  "credentials_url": "https://docverse.../orgs/rubin/credentials",
   "projects_url": "https://docverse.../orgs/rubin/projects",
   "members_url": "https://docverse.../orgs/rubin/members",
   "slug": "rubin",
   "title": "Rubin Observatory",
+  "base_domain": "lsst.io",
+  "url_scheme": "subdomain",
+  "publishing_store": {
+    "self_url": "https://docverse.../orgs/rubin/services/docs-bucket",
+    "label": "docs-bucket",
+    "category": "object_storage",
+    "provider": "cloudflare_r2"
+  },
+  "staging_store": {
+    "self_url": "https://docverse.../orgs/rubin/services/staging-bucket",
+    "label": "staging-bucket",
+    "category": "object_storage",
+    "provider": "cloudflare_r2"
+  },
+  "cdn_service": {
+    "self_url": "https://docverse.../orgs/rubin/services/cdn",
+    "label": "cdn",
+    "category": "cdn",
+    "provider": "cloudflare_workers"
+  },
+  "dns_service": null,
   "slug_rewrite_rules": [
     { "type": "ignore", "glob": "dependabot/**" },
     { "type": "prefix_strip", "prefix": "tickets/", "edition_kind": "draft" }
   ]
 }
 ```
+
+Service slots use embedded summaries (label, category, provider, and a HATEOAS URL to the full service detail) rather than bare label strings.
+Write operations (`POST`, `PATCH`) use `_label` suffixed fields (e.g., `publishing_store_label`) to assign services to slots.
+See {ref}`org-infrastructure` for the full infrastructure model.
 
 #### Slug preview
 
@@ -107,6 +139,59 @@ DELETE /orgs/:org/members/:id                        → remove membership (admi
 ```
 
 Membership `:id` uses a composite key format: `user:jdoe` or `group:g_spherex`. This is self-documenting in URLs and corresponds directly to the `principal_type:principal` pair which is unique within an org.
+
+#### Credentials
+
+```
+GET    /orgs/:org/credentials                          → list credentials (admin)
+POST   /orgs/:org/credentials                          → create credential (admin)
+GET    /orgs/:org/credentials/:label                   → get credential metadata (admin)
+DELETE /orgs/:org/credentials/:label                   → delete credential (admin)
+```
+
+Credentials store provider-level authentication secrets (API tokens, access keys).
+The `POST` request includes `label` and a `credentials` object whose schema depends on the `provider` field (see {ref}`org-infrastructure` for per-provider schemas).
+`GET` responses return metadata (label, provider, timestamps) but **never** the decrypted secrets.
+A credential cannot be deleted while any service references it.
+
+#### Services
+
+```
+GET    /orgs/:org/services                             → list services (admin)
+POST   /orgs/:org/services                             → create service (admin)
+GET    /orgs/:org/services/:label                      → get service detail (admin)
+PATCH  /orgs/:org/services/:label                      → update service (admin)
+DELETE /orgs/:org/services/:label                      → delete service (admin)
+```
+
+Services combine non-secret infrastructure configuration with a credential reference.
+The `POST` request includes `label`, a `config` object (whose schema depends on the `provider` field), and `credential_label` (referencing an existing credential).
+At creation time, Docverse validates that the credential exists and that its `provider` is compatible with the service's provider (see {ref}`org-infrastructure` for the compatibility matrix).
+`GET` responses include the full non-secret `config` (bucket name, account ID, etc.).
+`PATCH` accepts a partial update body.
+Currently supports `credential_label` to reassign the service to a different credential.
+Docverse validates that the new credential exists and that its provider is compatible with the service's provider.
+A service cannot be deleted while any organization slot references it.
+
+The `GET /orgs/:org/services/:label` response:
+
+```json
+{
+  "self_url": "https://docverse.../orgs/rubin/services/docs-bucket",
+  "org_url": "https://docverse.../orgs/rubin",
+  "credential_url": "https://docverse.../orgs/rubin/credentials/cloudflare",
+  "label": "docs-bucket",
+  "category": "object_storage",
+  "provider": "cloudflare_r2",
+  "config": {
+    "account_id": "abc123",
+    "bucket": "rubin-docs"
+  },
+  "credential_label": "cloudflare",
+  "date_created": "2026-01-15T00:00:00Z",
+  "date_updated": "2026-03-19T00:00:00Z"
+}
+```
 
 #### Projects
 

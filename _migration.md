@@ -250,9 +250,16 @@ Or, using the dedicated `docverse-upload` action directly:
     token: ${{ secrets.DOCVERSE_TOKEN }}
 ```
 
-### Migration phases
+### Migration strategy: cutover approaches
 
-The migration proceeds in four phases, each with a clear milestone and rollback strategy:
+The data migration and client migration sections above describe _what_ moves and _how_ uploads change.
+This section addresses the sequencing — specifically, how to coordinate the DNS cutover (switching `*.lsst.io` from Fastly to Cloudflare) with the CI workflow migration (switching repositories from `ltd-upload` to `docverse-upload`).
+
+The two approaches differ in whether these transitions happen simultaneously or independently.
+
+#### Option A: Coordinated cutover
+
+In this approach, all changes land in a single maintenance window: a final data sync runs, all workflow PRs and reusable workflow updates are merged, and DNS switches to Cloudflare.
 
 | Phase | Description | Key milestone | Rollback strategy |
 |---|---|---|---|
@@ -261,13 +268,179 @@ The migration proceeds in four phases, each with a clear milestone and rollback 
 | 2: Client preparation | Prepare all workflow changes without activating them: update `ltd-upload`/`docverse-upload` action, update reusable workflows on branches, open automated PRs for custom-workflow repos. Provision `DOCVERSE_TOKEN` org-level secrets. Test against Docverse staging. | All PRs open and tested; org secrets provisioned | Close PRs; no user impact (LTD unchanged) |
 | 3: Cutover | Short maintenance window: run final data sync to capture builds since Phase 1, merge all workflow PRs and reusable workflow changes, switch `*.lsst.io` DNS from Fastly to Cloudflare. New CI builds now flow to Docverse. | Production DNS on Cloudflare, all repos uploading to Docverse | Revert DNS to Fastly and revert workflow merges; Fastly configuration retained for rollback window |
 
-**Phase 0 and Phase 1** proceed with no user-visible changes — LTD continues to serve all production traffic.
-**Phase 2** is preparation — PRs are opened and tested but not merged, so LTD remains fully operational.
-**Phase 3** is the atomic cutover within a short maintenance window.
+Phase 0 and Phase 1 proceed with no user-visible changes — LTD continues to serve all production traffic.
+Phase 2 is preparation — PRs are opened and tested but not merged, so LTD remains fully operational.
+Phase 3 is the atomic cutover within a short maintenance window.
 Documentation remains readable throughout (LTD serves until DNS propagates).
 The window only affects new uploads, which are briefly paused while workflow changes and DNS propagate.
 A final data sync at the start of Phase 3 ensures Docverse has all builds up to the cutover moment.
 Estimated window: 1–2 hours.
+
+**Tradeoffs**: The coordinated cutover has a simpler overall architecture and a shorter dual-system period — once Phase 3 completes, LTD Keeper can be decommissioned immediately.
+However, it requires _all_ CI workflow changes to land simultaneously during the maintenance window.
+This is problematic for heterogeneous CI landscapes where projects use custom workflows, Jenkins pipelines, or other non-standard upload patterns that cannot be updated via a reusable workflow change or automated PR.
+
+#### Option B: Sync job with gradual client migration (recommended)
+
+This approach decouples the hosting migration (DNS cutover) from the client migration (CI workflow updates).
+DNS switches to Cloudflare early, while LTD Keeper continues running.
+A sync job mirrors new builds from LTD into Docverse, allowing projects to migrate their CI workflows individually at their own pace.
+
+The reusable workflow update handles Sphinx technotes automatically — projects using `rubin-sphinx-technote-workflows` migrate with zero per-repo changes when the reusable workflow is updated.
+The sync job bridges everything else: LaTeX technotes with custom CI, old reStructuredText technotes with legacy CI patterns, software documentation projects with custom build/upload workflows, and Jenkins-based projects.
+
+Rather than requiring simultaneous PRs to all these project types during a maintenance window, the sync job enables each project team to migrate on their own schedule.
+The sync job also serves as a **migration tracking tool**: the set of projects still flowing through the sync path is exactly the set that hasn't been migrated yet, providing clear visibility into migration progress.
+
+##### Revised migration phases
+
+| Phase | Description | Key milestone | Rollback strategy |
+|---|---|---|---|
+| 0: Preparation | Same as Option A: deploy Docverse, create organizations, configure infrastructure, validate with test projects. | Docverse deployed and validated | Remove Docverse deployment; no user impact |
+| 1: Data migration | Same as Option A: run `docverse migrate` for all products, verify on test domain. | All active builds and editions migrated and verified | Discard migrated data and re-run; LTD still serving |
+| 2: DNS cutover | Switch `*.lsst.io` DNS from Fastly to Cloudflare. Deploy and start the sync job. Update the reusable workflow and merge automated PRs for projects that are ready. No requirement for all projects to migrate simultaneously. | Production DNS on Cloudflare; sync job running | Revert DNS to Fastly; stop sync job |
+| 3: Gradual client migration | Projects migrate their CI workflows individually. The sync job handles projects still uploading to LTD. Monitor the sync job dashboard to track migration progress. | All projects migrated to native Docverse uploads | Sync job continues to bridge any remaining projects |
+| 4: Decommission | Stop the sync job. Shut down LTD Keeper. Remove LTD infrastructure. | LTD Keeper decommissioned | N/A (all projects on Docverse) |
+
+Phase 2 replaces the coordinated cutover with a DNS-only switch.
+Because the sync job mirrors LTD builds into Docverse, documentation remains continuously available — projects that haven't migrated their CI continue to upload to LTD, and the sync job ensures those builds appear in Docverse within seconds.
+
+Phase 3 is an extended period (weeks to months) during which project teams migrate at their own pace.
+The reusable workflow update migrates the majority of Sphinx technotes immediately.
+The sync job bridges the remaining projects until they complete their individual migrations.
+
+##### Sync job design
+
+The sync job is a polling service that discovers new builds in LTD, copies their objects to the Docverse object store, and registers them via the Docverse API.
+
+```{mermaid}
+sequenceDiagram
+    participant Sync as Sync Job
+    participant LTD_API as LTD Keeper API
+    participant S3 as LTD S3 Bucket
+    participant DV_API as Docverse API
+    participant R2 as Docverse R2 Bucket
+    participant KV as CDN Edge KV
+
+    loop Every 60 seconds
+        Sync->>LTD_API: GET /products/ (list all products)
+        LTD_API-->>Sync: Product list
+
+        loop For each synced product
+            Sync->>LTD_API: GET /products/{slug}/builds/?uploaded=true
+            LTD_API-->>Sync: Builds since last checkpoint
+
+            loop For each new build
+                Sync->>S3: List objects at {product}/builds/{slug}/
+                S3-->>Sync: Object keys + metadata
+
+                loop For each object
+                    Sync->>R2: PUT {project}/__builds/{build_id}/{file}
+                end
+
+                Sync->>DV_API: Register build (metadata, object inventory)
+                DV_API-->>Sync: Build created
+            end
+
+            Sync->>LTD_API: GET /products/{slug}/editions/
+            LTD_API-->>Sync: Edition states
+
+            loop For each edition with updated build pointer
+                Sync->>DV_API: Update edition → build mapping
+                DV_API->>KV: Write edition→build mapping
+            end
+        end
+    end
+```
+
+**Discovery**: The sync job polls the LTD API for builds where `uploaded=true` with a `date_created` after the last checkpoint timestamp.
+Each polling cycle processes only new builds, making the steady-state cost proportional to the build rate rather than the total build count.
+
+**Build identity mapping**: The sync job maintains a mapping of `(product_slug, ltd_build_slug)` → `docverse_build_id`.
+This mapping is stored in the Docverse database (or a dedicated sync state table) and ensures that repeated syncs are idempotent — a build that has already been synced is skipped.
+
+**Object transfer**: Objects are copied directly from `{product}/builds/{build_id}/` in the LTD S3 bucket to `{project}/__builds/{build_id}/` in the Docverse R2 bucket.
+This bypasses the normal Docverse tarball upload flow (tarball → unpack → inventory) because the objects are already unpacked in the LTD bucket.
+The sync job constructs the `BuildObject` inventory by listing the copied objects and recording their keys, content hashes, content types, and sizes.
+The build is then registered via the Docverse API with the pre-populated inventory.
+
+**Edition sync**: After syncing builds, the sync job checks each edition's `build_id` and `date_rebuilt` fields in the LTD API.
+If an edition's build pointer has changed since the last sync, the sync job updates the corresponding Docverse edition to point to the newly synced build.
+
+**Project ownership model**: Each project in Docverse has a sync state that is one of:
+
+```{mermaid}
+stateDiagram-v2
+    [*] --> SyncedFromLTD: Project created by migration tool
+    SyncedFromLTD --> NativeDocverse: Project team migrates CI workflow
+    NativeDocverse --> [*]: Steady state
+
+    state SyncedFromLTD {
+        [*] --> Polling
+        Polling --> CopyingBuild: New build detected
+        CopyingBuild --> UpdatingEditions: Build registered
+        UpdatingEditions --> Polling: Editions updated
+    }
+```
+
+- **SyncedFromLTD**: The sync job actively mirrors builds from LTD for this project. The project's CI workflows still upload to LTD Keeper.
+- **NativeDocverse**: The project's CI workflows upload directly to Docverse. The sync job ignores this project.
+
+The transition from `SyncedFromLTD` to `NativeDocverse` happens when the project team merges their CI workflow update.
+A Docverse API endpoint (or CLI command) flips the project's sync state, and the sync job stops polling LTD for that project.
+
+##### Sync latency and consistency
+
+A 60-second polling interval adds negligible latency to the documentation publish pipeline.
+Documentation builds already take minutes (Sphinx builds, CI pipeline overhead), so an additional 60-second delay before the build appears on `*.lsst.io` is imperceptible to users.
+
+There is a brief consistency window after a build completes in LTD but before the sync job copies it to Docverse.
+During this window, the LTD API shows the build as complete, but the Cloudflare-served site has not yet been updated.
+This window is at most one polling interval (60 seconds) plus the time to copy objects — typically a few seconds for a standard documentation build.
+
+##### Two sources of truth
+
+The sync job creates a period where both LTD Keeper and Docverse contain build data for the same projects.
+The project ownership model (described above) prevents conflicts:
+
+- The sync job only writes to projects in the `SyncedFromLTD` state. It never modifies projects that have transitioned to `NativeDocverse`.
+- Direct Docverse uploads are rejected for projects in the `SyncedFromLTD` state (or at minimum, logged as warnings), preventing accidental dual-writes.
+- Project owners are notified when their project is in the synced state and given instructions for migrating their CI workflow.
+
+#### Comparison of approaches
+
+| Aspect | Option A: Coordinated cutover | Option B: Sync job |
+|---|---|---|
+| Maintenance window | 1–2 hours; all changes land simultaneously | Minutes for DNS cutover only |
+| CI migration timing | All projects migrate during the window | Projects migrate individually over weeks/months |
+| Dual-system duration | Minimal (LTD decommissioned after Phase 3) | Extended (LTD runs until all projects migrate) |
+| Architecture complexity | Lower (no sync job) | Higher (sync job + project ownership model) |
+| Risk during cutover | Higher (many simultaneous changes) | Lower (DNS-only change, sync provides continuity) |
+| Development effort | Lower (no sync job to build) | Moderate (sync job is straightforward ETL, not a complex service) |
+| Ongoing S3 egress | One-time during data migration | Continuous during sync period (proportional to build rate) |
+| Migration visibility | Binary (all migrated or not) | Per-project tracking via sync state |
+| Non-standard CI support | Requires all custom workflows ready before cutover | Custom workflows migrate on their own schedule |
+
+#### Recommendation
+
+**The sync job approach (Option B) is recommended for the Rubin deployment.**
+
+While Sphinx technotes using `rubin-sphinx-technote-workflows` migrate automatically via the reusable workflow update, many project types do not benefit from this pattern:
+
+- **LaTeX technotes** — custom CI workflows, no reusable workflow
+- **Old reStructuredText technotes** — may use legacy CI patterns
+- **Software documentation projects** (e.g., `pipelines.lsst.io`) — custom build and upload workflows
+- **Jenkins-based projects** — entirely separate CI system
+
+Requiring all of these projects to have PRs ready and merged during a 1–2 hour maintenance window is operationally risky and logistically complex.
+The sync job avoids this by letting each project team migrate on their own schedule, while the sync job ensures continuous documentation availability.
+
+The sync job is also simpler than it might appear at first glance.
+Unlike the rejected API compatibility shim (Option B in the client migration section), the sync job does not need to proxy uploads or translate between upload formats in real time.
+It reads completed builds from LTD — objects that are already unpacked and stored in S3 — and copies them to R2.
+This is straightforward ETL, not a stateful proxy service.
+
+The coordinated cutover (Option A) remains a viable alternative for smaller deployments where all projects use the reusable workflow pattern and can be migrated simultaneously.
 
 ### Risk mitigation
 
@@ -279,3 +452,7 @@ Estimated window: 1–2 hours.
 | Gafaelfawr token provisioning issues | CI uploads fail | Medium | Provision and test org-level secrets during Phase 2 preparation; validate with test uploads before cutover |
 | Builds in flight during cutover | Some CI builds fail or upload to wrong backend | Low | Announce maintenance window in advance; re-trigger any builds that fail during the cutover window |
 | Reusable workflow update breaks downstream repos | CI failures across many repos | Low | Test reusable workflow changes against a representative sample of downstream repos before merging; reusable workflow versioning allows rollback |
+| Sync job latency | Builds visible in LTD before Docverse | Low | 60-second polling interval keeps latency well within acceptable bounds; monitoring alerts if sync falls behind |
+| Dual source of truth conflicts | Inconsistent documentation state | Low | Project ownership model enforces single-writer semantics; sync job only writes to `SyncedFromLTD` projects; direct uploads blocked for synced projects |
+| Sync job failure | New LTD builds not mirrored to Docverse | Medium | Health check endpoint and monitoring; dead-letter queue for failed syncs; manual re-sync capability; LTD content remains accessible as fallback during sync outage |
+| Extended S3 egress costs | Higher AWS costs during sync period | Low | Costs are proportional to build rate (not total data volume); most builds are small (< 100 MB); monitor egress and set billing alerts |
