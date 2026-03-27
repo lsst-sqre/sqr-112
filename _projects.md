@@ -62,7 +62,7 @@ sequenceDiagram
    7. **Render project dashboard and metadata JSON** once after all edition updates.
 
 :::{note}
-The initial implementation covers steps 1–4 (download, unpack, upload, and inventory). Edition tracking evaluation (step 5), edition updates (step 6), and dashboard rendering (step 7) are planned for subsequent development phases. The initial inventory implementation stores aggregate metrics (`object_count`, `total_size_bytes`) on the build record rather than per-object rows in the `BuildObject` table.
+The initial implementation covers steps 1–4 (download, unpack, upload, and inventory). Edition tracking evaluation (step 5), edition updates (step 6), and dashboard rendering (step 7) are planned for subsequent development phases. The initial inventory implementation stores aggregate metrics (`object_count`, `total_size_bytes`) on the build record rather than per-object rows in the `BuildObject` table. The worker uses a single phase named `unpacking` for this work, with a terminal phase `complete`. The full phase progression described in the queue design (`inventory`, `tracking`, `editions`, `dashboard`) will be adopted when the later pipeline stages are implemented.
 :::
 
 The API handler for step 4 is thin: it validates the request, updates the build status to `processing`, enqueues the background job, and returns the `queue_url`.
@@ -116,7 +116,8 @@ async def unpack_and_upload(
             if file_obj is None:
                 continue
             content = file_obj.read()
-            key = f"__builds/{build_id}/{member.name}"
+            name = member.name.removeprefix("./")
+            key = f"__builds/{build_id}/{name}"
 
             async def _upload(k: str, data: bytes) -> None:
                 async with semaphore:
@@ -135,7 +136,7 @@ async def unpack_and_upload(
     return uploaded_keys
 ```
 
-The semaphore bounds concurrency (e.g., 50 concurrent uploads) to avoid overwhelming the object store API. Content types are inferred from file extensions.
+The semaphore bounds concurrency (e.g., 50 concurrent uploads) to avoid overwhelming the object store API. Content types are inferred from file extensions. The `./` prefix stripping handles tarballs created with relative paths (e.g., `./index.html` instead of `index.html`); some tar creation tools prepend `./` to member names, and Cloudflare R2 treats `./` as a literal path component, which would create incorrectly-prefixed keys.
 
 :::{note}
 The code example above shows separate `staging_store` and `publishing_store` parameters for clarity. The initial implementation uses a single `object_store` resolved from `org.resolved_staging_store_label`, which falls back to the publishing store when no dedicated staging store is configured. Both the staging read and publishing write use this single store.
