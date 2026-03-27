@@ -60,9 +60,14 @@ The credential's `provider` field determines the schema of the encrypted payload
 | Provider      | Encrypted fields                        | Used by service providers                     |
 | ------------- | --------------------------------------- | --------------------------------------------- |
 | `aws`         | `access_key_id`, `secret_access_key`    | `aws_s3`, `cloudfront`, `route53`             |
-| `cloudflare`  | `api_token`                             | `cloudflare_r2`, `cloudflare_workers`, `cloudflare_dns` |
+| `cloudflare`  | `api_token`                             | `cloudflare_workers`, `cloudflare_dns`        |
 | `fastly`      | `api_token`                             | `fastly`                                      |
 | `gcp`         | `service_account_json`                  | `gcs`, `google_cloud_cdn`                     |
+| `s3`          | `access_key_id`, `secret_access_key`    | `cloudflare_r2`, `minio`                      |
+
+The `s3` credential provider uses the same field names as `aws` (`access_key_id` and `secret_access_key`) but represents generic S3-compatible credentials that are not tied to AWS IAM.
+Cloudflare R2 and MinIO both expose S3-compatible APIs using their own access key systems, which are distinct from AWS credentials.
+The `aws` credential is reserved for services that use AWS-native IAM credentials.
 
 Credentials are created via `POST /orgs/:org/credentials` and are **write-only** — the GET response returns metadata (label, provider, timestamps) but never the decrypted secrets.
 
@@ -76,8 +81,8 @@ The service's `provider` field determines the config schema and which credential
 | Provider         | Config fields                  | Compatible credential | Notes |
 | ---------------- | ------------------------------ | --------------------- | ----- |
 | `aws_s3`         | `bucket`, `region`             | `aws`                 | Native AWS S3 |
-| `cloudflare_r2`  | `account_id`, `bucket`         | `cloudflare`          | S3-compatible API, zero egress |
-| `minio`          | `endpoint_url`, `bucket`       | `aws`                 | S3-compatible API |
+| `cloudflare_r2`  | `account_id`, `bucket`         | `s3`                  | S3-compatible API, zero egress |
+| `minio`          | `endpoint_url`, `bucket`       | `s3`                  | S3-compatible API |
 | `gcs`            | `bucket`, `project_id`         | `gcp`                 | Google Cloud Storage |
 
 **CDN providers:**
@@ -113,10 +118,23 @@ The organization model has four service slots that reference services by label:
 Slots are assigned via `PATCH /orgs/:org` using `_label` suffixed fields (e.g., `publishing_store_label`).
 In GET responses, slots are returned as embedded service summaries (label, category, provider, and a HATEOAS URL to the full service detail) rather than bare labels.
 
-#### Example: all-Cloudflare setup
+#### Example: Cloudflare R2 + Workers setup
+
+R2 storage uses S3-compatible credentials (separate from the Cloudflare API token used for Workers and DNS), so this setup requires two credentials:
 
 ```json
-// 1. Create one credential for all Cloudflare services
+// 1. Create an S3-compatible credential for R2 storage
+// POST /orgs/rubin/credentials
+{
+    "label": "r2",
+    "credentials": {
+        "provider": "s3",
+        "access_key_id": "r2-access-key-xxx",
+        "secret_access_key": "r2-secret-key-xxx"
+    }
+}
+
+// Create a Cloudflare credential for Workers and DNS
 // POST /orgs/rubin/credentials
 {
     "label": "cloudflare",
@@ -126,7 +144,7 @@ In GET responses, slots are returned as embedded service summaries (label, categ
     }
 }
 
-// 2. Create services referencing the same credential
+// 2. Create services referencing appropriate credentials
 // POST /orgs/rubin/services
 {
     "label": "docs-bucket",
@@ -135,7 +153,7 @@ In GET responses, slots are returned as embedded service summaries (label, categ
         "account_id": "abc123",
         "bucket": "rubin-docs"
     },
-    "credential_label": "cloudflare"
+    "credential_label": "r2"
 }
 
 // POST /orgs/rubin/services
@@ -146,7 +164,7 @@ In GET responses, slots are returned as embedded service summaries (label, categ
         "account_id": "abc123",
         "bucket": "rubin-docs-staging"
     },
-    "credential_label": "cloudflare"
+    "credential_label": "r2"
 }
 
 // POST /orgs/rubin/services
