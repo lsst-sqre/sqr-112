@@ -397,11 +397,11 @@ spec:
           containers:
             - name: docverse-enqueue
               image: ghcr.io/lsst-sqre/docverse:latest
-              command: ["docverse", "enqueue", "lifecycle_eval"]
+              command: ["docverse-admin", "enqueue", "lifecycle_eval"]
           restartPolicy: OnFailure
 ```
 
-The `docverse enqueue` CLI command connects to the database and Redis, creates a `QueueJob` record with `status: queued`, enqueues the job via the queue backend, and exits. The actual work is performed by the Docverse worker process.
+The `docverse-admin enqueue` CLI command connects to the database and Redis, creates a `QueueJob` record with `status: queued`, enqueues the job via the queue backend, and exits. The actual work is performed by the Docverse worker process.
 
 #### Schedule table
 
