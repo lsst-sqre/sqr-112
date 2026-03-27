@@ -63,6 +63,14 @@ Cloudflare R2 is accessed via the S3-compatible implementation.
 R2's S3 API compatibility is comprehensive enough that a dedicated implementation is not required.
 The key difference is R2's zero egress fees, which is a cost consideration rather than an API difference.
 
+#### R2 compatibility notes
+
+The S3-compatible implementation includes several configuration choices for Cloudflare R2 compatibility:
+
+- **Signature version**: The `botocore.Config` forces `signature_version="s3v4"` (AWS Signature Version 4), which R2 requires.
+- **Checksum handling**: `request_checksum_calculation="when_required"` and `response_checksum_validation="when_required"` disable the trailing checksum behavior introduced in recent AWS SDK versions, which R2 does not support.
+- **Presigned URL uploads**: The worker's `upload_object` method uses a two-step presigned URL approach: it generates a presigned PUT URL via `generate_presigned_url`, then uploads the data via httpx `PUT` to that URL. This avoids checksum signing issues with R2's `put_object` API. The `S3ObjectStore` accepts an optional `httpx.AsyncClient` — when provided (by the worker), uploads use presigned URLs; when absent (in handler contexts that only generate presigned URLs for clients), direct `put_object` is available as a fallback.
+
 #### Object store interface
 
 The protocol defines these operations:
@@ -144,8 +152,16 @@ docverse/                           # lsst-sqre/docverse
 │               ├── __init__.py
 │               ├── _client.py      # DocverseClient
 │               ├── _cli.py         # CLI entry point
-│               ├── _models.py      # Pydantic request/response models
-│               └── _tar.py         # Tarball creation utility
+│               ├── _exceptions.py  # Client exception types
+│               ├── _tar.py         # Tarball creation utility
+│               └── models/         # Pydantic request/response models
+│                   ├── __init__.py
+│                   ├── builds.py
+│                   ├── credentials.py
+│                   ├── infrastructure.py
+│                   ├── organizations.py
+│                   ├── services.py
+│                   └── ...
 ├── src/
 │   └── docverse/
 │       ├── ...
@@ -384,7 +400,7 @@ The client package owns every Pydantic model that appears in API request and res
 The server imports these models and can subclass them to add server-side concerns (database constructors, internal validators), but the wire format is always defined in the client.
 
 ```{code-block} python
-:caption: docverse/client/_models.py
+:caption: docverse/client/models/builds.py
 
 from pydantic import BaseModel, HttpUrl
 
@@ -410,7 +426,7 @@ class BuildResponse(BaseModel):
 ```{code-block} python
 :caption: docverse/models/build.py
 
-from docverse.client._models import BuildCreate as ClientBuildCreate
+from docverse.client.models import BuildCreate as ClientBuildCreate
 from ..db import Build as BuildRow
 
 class BuildCreate(ClientBuildCreate):
@@ -531,6 +547,7 @@ $ docverse upload \
 | `--base-url`       | `DOCVERSE_API`       | `https://roundtable.lsst.cloud/docverse/api` | Docverse API base URL                     |
 | `--alternate-name` | `DOCVERSE_ALTERNATE` | —                          | Alternate name for scoped editions        |
 | `--no-wait`        |                      | wait enabled               | Return immediately after signaling upload |
+| `--verbose` / `-v` |                      | disabled                   | Show detailed HTTP request/response info  |
 
 #### Exit codes
 
