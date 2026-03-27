@@ -308,7 +308,7 @@ See {ref}`organizations` for the encryption scheme, key rotation, and the three-
 | `id`                    | int               | Auto-increment primary key |
 | `organization_id`       | FK → Organization | Owning organization |
 | `label`                 | str               | Human-friendly name (e.g., `cloudflare`, `aws-prod`) |
-| `provider`              | str               | Cloud provider identifier: `aws`, `cloudflare`, `fastly`, or `gcp` |
+| `provider`              | str               | Cloud provider identifier: `aws`, `cloudflare`, `fastly`, `gcp`, or `s3` |
 | `encrypted_credentials` | bytea             | Fernet token containing the encrypted credential payload (JSON-encoded) |
 | `date_created`          | datetime          | Creation timestamp |
 | `date_updated`          | datetime          | Last modification timestamp |
