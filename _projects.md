@@ -167,7 +167,7 @@ Two concepts govern edition behavior:
 
 Editions are identified by URL-safe slugs. The slug system has three layers:
 
-1. **Reserved slugs**: `__main` is the sole reserved slug, representing the default edition that serves at the project root (no `/v/` prefix in the URL). It does not correspond to a git ref and uses double-underscore prefix to avoid collisions with any git branch or tag name.
+1. **Reserved slugs**: `__main` is the sole reserved slug, representing the default edition that serves at the project root (no `/v/` prefix in the URL). It does not correspond to a git ref and uses double-underscore prefix to avoid collisions with any git branch or tag name. The `__main` edition is auto-created when the project is created (see {ref}`auto-creation-main-edition` below), not when the first build arrives.
 
 2. **Org-configurable rewrite rules**: organizations can configure pattern-based transforms from git ref → edition slug. These are an ordered list of rules where the first match wins, with three rule types: `prefix_strip`, `regex`, and `ignore`. For example, Rubin's convention uses a `prefix_strip` rule to rewrite `tickets/DM-12345` → slug `DM-12345`. See the {ref}`edition-slug-rewrite-rules` section for the full rule format, evaluation algorithm, and examples.
 
@@ -452,6 +452,23 @@ When an edition is auto-created, its kind is assigned based on the tracking mode
 `alternate` editions are exempt from `draft_inactivity` lifecycle rules by default — they represent long-lived deployment targets, not transient branches. Alternate editions can be created manually via the API, or auto-created when builds carry an `alternate_name` (see below). Slug rewrite rules can also assign `edition_kind: "alternate"` to control the kind assigned during auto-creation.
 
 ### Auto-creation of editions
+
+There are two auto-creation contexts: project creation and build processing.
+
+(auto-creation-main-edition)=
+
+#### Auto-creation on project creation
+
+When a new project is created via `POST /orgs/:org/projects`, the project service automatically creates the project's `__main` edition alongside the project record. The `__main` edition is created with:
+
+- **Slug**: `__main` (the reserved system slug)
+- **Kind**: `main`
+- **`lifecycle_exempt`**: `true` (the `__main` edition is never cleaned up by lifecycle rules)
+- **Tracking mode and params**: determined by the {ref}`default-edition-config` precedence chain
+
+Because the `__main` slug starts with `__` (the reserved prefix), it cannot be created through the normal edition creation request model, whose slug validation requires the pattern `^[a-z0-9][a-z0-9-]*[a-z0-9]$`. Instead, the edition store provides an internal creation method that bypasses slug validation for system-created editions. This method accepts raw field values rather than a validated edition creation model, allowing slugs that violate the user-facing constraints. The public edition creation path (used by the API endpoint for user-created editions) continues to enforce the slug pattern, so users cannot create `__`-prefixed editions.
+
+#### Auto-creation on build processing
 
 When a new build arrives and matches no existing edition's tracking criteria, Docverse can auto-create editions:
 
