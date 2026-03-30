@@ -428,6 +428,18 @@ The full set of tracking modes in Docverse:
 
 Semver tracking supports tags both with and without a `v` prefix (e.g., `v2.1.0` and `2.1.0`).
 
+#### Edition matching query strategy
+
+When a build completes, the build processing worker must determine which editions should be updated. The edition matching query implements this in two phases:
+
+1. **Broad SQL query**: fetch all non-deleted editions for the build's project, ordered by slug. No SQL-level filtering on tracking mode or params is applied.
+2. **Application-level filtering**: iterate over the result set and match each edition against the build's `git_ref` and `alternate_name`:
+   - **`git_ref` editions** match when the build has no `alternate_name` and the edition's `tracking_params.git_ref` equals the build's `git_ref`.
+   - **`alternate_git_ref` editions** match when the build has an `alternate_name` and the edition's `tracking_params` match both the `git_ref` and `alternate_name`.
+   - Other tracking modes (semver, EUPS, etc.) apply their own comparison logic against the build's git ref.
+
+The two-phase approach is deliberate. Tracking params are stored as JSONB, and the matching logic varies by tracking mode — semver modes require version comparison, EUPS modes require tag pattern parsing, and so on. Fetching all project editions and filtering in application code keeps the query simple and the matching logic centralized, while the dataset per project is small enough (typically tens to low hundreds of editions) that the approach scales well without index optimization.
+
 #### The `alternate_git_ref` tracking mode
 
 The `alternate_git_ref` mode is the dedicated tracking mode for deployment-scoped editions. It matches builds by **both** a specific `git_ref` **and** an `alternate_name`, parameterized via `tracking_params`. For example, edition `usdf-dev--DM-12345` uses `alternate_git_ref` with `tracking_params: {"git_ref": "tickets/DM-12345", "alternate_name": "usdf-dev"}` — it updates only when a build arrives carrying that exact git ref and alternate name pair.
