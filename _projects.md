@@ -513,6 +513,17 @@ Docverse maintains an explicit log of every build that an edition has pointed to
 
 See {ref}`table-edition-build-history` for the column definition.
 
+#### Position management algorithm
+
+When a new build is recorded in an edition's history, positions are managed with a shift-then-insert approach:
+
+1. **Shift existing entries**: a single `UPDATE` increments the `position` column by 1 for all rows with the given `edition_id`. This pushes all existing entries down (position 1 becomes 2, position 2 becomes 3, etc.).
+2. **Insert new entry**: a new row is inserted with `position=1`, marking it as the most recent build for this edition.
+
+This ensures that position 1 always represents the current build and positions increase monotonically for older entries. The `position` value directly corresponds to "how many builds ago" — position 1 is the current build, position 5 means four builds have been published since this one.
+
+The shift-then-insert approach uses a bulk `UPDATE` rather than per-row manipulation, keeping the operation efficient even for editions with long histories. The `build_history_orphan` lifecycle rule references positions directly (e.g., "delete builds at position 5+ that are older than 30 days"), making the position semantics load-bearing for lifecycle evaluation.
+
 (edition-update-strategy)=
 ### Edition update strategy
 

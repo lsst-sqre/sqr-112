@@ -373,6 +373,8 @@ See {ref}`projects` for the rollback API and how lifecycle rules reference histo
 | `position`   | int            | Ordering position (1 = most recent) |
 | `date_created` | datetime     | When this history entry was recorded |
 
+Position 1 is always the most recent build. When a new history entry is recorded, all existing positions for that edition are shifted up by 1 (via a bulk `UPDATE`) before the new entry is inserted at position 1. See {ref}`projects` for the full algorithm.
+
 (table-dashboard-template)=
 
 #### DashboardTemplate
