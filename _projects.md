@@ -175,6 +175,29 @@ Editions are identified by URL-safe slugs. The slug system has three layers:
 
 An edition tracks a **slug**, not a single canonical git ref. Multiple git refs can map to the same slug through rewrite rules and all contribute builds to that edition. For example, if both `tickets/DM-12345` and `DM-12345` exist as branches and both rewrite to slug `DM-12345`, builds from either ref update the same edition. This fixes a bug in LTD Keeper where only one ref could contribute to a special-case edition.
 
+(default-edition-config)=
+
+### Default edition configuration
+
+When a project is created, its `__main` edition needs a tracking mode and parameters. The `DefaultEditionConfig` model defines this configuration:
+
+| Field             | Type              | Default       | Description                                                  |
+| ----------------- | ----------------- | ------------- | ------------------------------------------------------------ |
+| `tracking_mode`   | TrackingMode      | `git_ref`     | How the default edition tracks builds                         |
+| `tracking_params` | object (nullable) | `null`        | Mode-specific parameters (defaults to `{"git_ref": "main"}` at the service layer when `null` and mode is `git_ref`) |
+| `title`           | string            | `"Main"`      | Display title for the default edition                         |
+| `lifecycle_exempt` | bool             | `true`        | Whether the default edition is exempt from lifecycle rules    |
+
+#### Configuration precedence
+
+The default edition configuration follows a three-tier precedence chain, resolved at project creation time:
+
+1. **Request-level**: the `default_edition` field on the `ProjectCreate` request body. When provided, this takes priority.
+2. **Organization-level**: the `default_edition_config` JSONB column on the organization. Used when the request omits `default_edition`.
+3. **Hardcoded fallback**: `git_ref` tracking the `main` branch, title `"Main"`, `lifecycle_exempt=true`. Used when neither the request nor the organization provides a config.
+
+This precedence chain means organizations can set a single default (e.g., tracking `develop` instead of `main`) without requiring every project creation request to specify it, while individual projects can still override when needed.
+
 (edition-slug-rewrite-rules)=
 
 ### Edition slug rewrite rules

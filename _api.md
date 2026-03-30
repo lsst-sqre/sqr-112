@@ -113,7 +113,13 @@ The `GET /orgs/:org` response includes navigation URLs, infrastructure service s
   "slug_rewrite_rules": [
     { "type": "ignore", "glob": "dependabot/**" },
     { "type": "prefix_strip", "prefix": "tickets/", "edition_kind": "draft" }
-  ]
+  ],
+  "default_edition_config": {
+    "tracking_mode": "git_ref",
+    "tracking_params": { "git_ref": "main" },
+    "title": "Main",
+    "lifecycle_exempt": true
+  }
 }
 ```
 
