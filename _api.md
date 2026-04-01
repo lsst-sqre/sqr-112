@@ -323,10 +323,13 @@ The `POST` to create an edition accepts the following request body:
 | `tracking_params` | object | no       | Mode-specific parameters (e.g., `{"git_ref": "main"}` for `git_ref` mode, or `{"git_ref": "main", "alternate_name": "usdf-dev"}` for `alternate_git_ref` mode). Required for parameterized tracking modes. |
 
 ```
-GET    /orgs/:org/projects/:project/editions/:ed/history → edition-build history (reader+, paginated)
+GET    /orgs/:org/projects/:project/editions/:ed/history  → edition-build history (reader+, paginated)
+POST   /orgs/:org/projects/:project/editions/:ed/rollback → roll back to a previous build (admin)
 ```
 
 The history endpoint returns a paginated list of builds the edition has pointed to, ordered by position (most recent first). Each entry includes the build reference, timestamp, and position.
+
+The rollback endpoint accepts `{"build": "<base32-id>"}` and reassigns the edition to the specified build, recording a new history entry. The build must appear in the edition's history. Returns the updated edition resource.
 
 The `GET /orgs/:org/projects/:project/editions/:ed` response:
 
@@ -336,6 +339,7 @@ The `GET /orgs/:org/projects/:project/editions/:ed` response:
   "project_url": "https://docverse.../orgs/rubin/projects/pipelines",
   "build_url": "https://docverse.../orgs/rubin/projects/pipelines/builds/01HQ-3KBR-T5GN-8W",
   "history_url": "https://docverse.../orgs/rubin/projects/pipelines/editions/__main/history",
+  "rollback_url": "https://docverse.../orgs/rubin/projects/pipelines/editions/__main/rollback",
   "published_url": "https://pipelines.lsst.io/",
   "slug": "__main",
   "kind": "main",
