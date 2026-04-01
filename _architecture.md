@@ -132,10 +132,11 @@ This monorepo structure and the client-owned model pattern are integral to maint
 
 (client-server-monorepo)=
 
-### Client-server monorepo
+### Monorepo structure
 
-The Python client and the Docverse server share a single Git repository, following the monorepo pattern established by [Squarebot](https://github.com/lsst-sqre/squarebot).
-The server package lives at the repository root (matching the [Ook](https://github.com/lsst-sqre/ook) and [Safir](https://github.com/lsst-sqre/safir) conventions), which simplifies Docker builds and makes `nox-uv`'s `@session` decorator work naturally:
+The Python client, server, and Cloudflare Worker share a single Git repository.
+The server package lives at the repository root (matching the [Ook](https://github.com/lsst-sqre/ook) and [Safir](https://github.com/lsst-sqre/safir) conventions), the Python client is in `client/`, and the Cloudflare Worker is in `cloudflare-worker/`.
+This co-location ensures that changes to the KV key/value schema — written by the Python publisher, read by the Worker — land in the same commit, preventing contract drift between the two runtimes.
 
 ```
 docverse/                           # lsst-sqre/docverse
@@ -162,6 +163,12 @@ docverse/                           # lsst-sqre/docverse
 │                   ├── organizations.py
 │                   ├── services.py
 │                   └── ...
+├── cloudflare-worker/              # Cloudflare Worker (TypeScript)
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── wrangler.toml               # per-org environments
+│   └── src/
+│       └── index.ts                # Worker entry point
 ├── src/
 │   └── docverse/
 │       ├── ...
@@ -169,12 +176,13 @@ docverse/                           # lsst-sqre/docverse
 └── tests/
 ```
 
-| Attribute     | Client                                | Server                                          |
-| ------------- | ------------------------------------- | ----------------------------------------------- |
-| PyPI name     | `docverse-client`                     | `docverse`                                      |
-| Import path   | `docverse.client`                     | `docverse`                                      |
-| Package style | Namespace package (`docverse.client`) | Namespace package (`docverse`)                  |
-| Location      | `client/` subdirectory                | Repository root                                 |
+| Attribute     | Client                                | Server                              | Cloudflare Worker                         |
+| ------------- | ------------------------------------- | ----------------------------------- | ----------------------------------------- |
+| Package name  | `docverse-client`                     | `docverse`                          | `docverse-router` (Wrangler)              |
+| Import path   | `docverse.client`                     | `docverse`                          | N/A (TypeScript)                          |
+| Package style | Namespace package (`docverse.client`) | Namespace package (`docverse`)      | npm package                               |
+| Location      | `client/` subdirectory                | Repository root                     | `cloudflare-worker/` subdirectory         |
+| Deploy target | PyPI                                  | Docker image → Kubernetes           | Cloudflare Workers (per-org environments) |
 
 The monorepo is motivated by four concerns:
 
