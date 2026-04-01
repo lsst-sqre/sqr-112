@@ -113,7 +113,13 @@ The `GET /orgs/:org` response includes navigation URLs, infrastructure service s
   "slug_rewrite_rules": [
     { "type": "ignore", "glob": "dependabot/**" },
     { "type": "prefix_strip", "prefix": "tickets/", "edition_kind": "draft" }
-  ]
+  ],
+  "default_edition_config": {
+    "tracking_mode": "git_ref",
+    "tracking_params": { "git_ref": "main" },
+    "title": "Main",
+    "lifecycle_exempt": true
+  }
 }
 ```
 
@@ -225,11 +231,52 @@ The `GET /orgs/:org/projects/:project` response includes navigation URLs:
   "slug": "pipelines",
   "title": "LSST Science Pipelines",
   "doc_repo": "https://github.com/lsst/pipelines_lsst_io",
-  "slug_rewrite_rules": null
+  "slug_rewrite_rules": null,
+  "default_edition": {
+    "self_url": "https://docverse.../orgs/rubin/projects/pipelines/editions/__main",
+    "project_url": "https://docverse.../orgs/rubin/projects/pipelines",
+    "build_url": "https://docverse.../orgs/rubin/projects/pipelines/builds/01HQ-3KBR-T5GN-8W",
+    "published_url": "https://pipelines.lsst.io/",
+    "slug": "__main",
+    "title": "Main",
+    "kind": "main",
+    "tracking_mode": "git_ref",
+    "tracking_params": { "git_ref": "main" },
+    "lifecycle_exempt": true,
+    "date_created": "2026-01-15T00:00:00Z",
+    "date_updated": "2026-02-08T12:00:00Z"
+  }
 }
 ```
 
+The `default_edition` field contains the `__main` edition's full representation as a nested object. It is populated on single-project responses (`GET /orgs/:org/projects/:project`, `POST /orgs/:org/projects`, `PATCH /orgs/:org/projects/:project`) but **omitted from list responses** (`GET /orgs/:org/projects`) to keep collection payloads compact. In list responses, `default_edition` is `null`.
+
 The `slug_rewrite_rules` field is `null` when the project inherits the org's rules, or contains a project-specific rule list when overridden.
+
+The `POST` to create a project accepts the following request body:
+
+```json
+{
+  "slug": "pipelines",
+  "title": "LSST Science Pipelines",
+  "doc_repo": "https://github.com/lsst/pipelines_lsst_io",
+  "default_edition": {
+    "tracking_mode": "git_ref",
+    "tracking_params": { "git_ref": "develop" },
+    "title": "Development",
+    "lifecycle_exempt": true
+  }
+}
+```
+
+| Field             | Type   | Required | Description                                                                                         |
+| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------- |
+| `slug`            | string | yes      | URL-safe project identifier. Must be unique within the organization.                                 |
+| `title`           | string | yes      | Human-readable title for dashboards and metadata.                                                    |
+| `doc_repo`        | string | yes      | GitHub repository URL for the documentation source.                                                  |
+| `default_edition` | object | no       | Configuration for the `__main` edition. When omitted, the organization's `default_edition_config` is used; when the organization has none, the hardcoded fallback applies. See {ref}`default-edition-config`. |
+
+The response includes the created project with its `default_edition` populated.
 
 #### Editions
 
@@ -276,10 +323,13 @@ The `POST` to create an edition accepts the following request body:
 | `tracking_params` | object | no       | Mode-specific parameters (e.g., `{"git_ref": "main"}` for `git_ref` mode, or `{"git_ref": "main", "alternate_name": "usdf-dev"}` for `alternate_git_ref` mode). Required for parameterized tracking modes. |
 
 ```
-GET    /orgs/:org/projects/:project/editions/:ed/history → edition-build history (reader+, paginated)
+GET    /orgs/:org/projects/:project/editions/:ed/history  → edition-build history (reader+, paginated)
+POST   /orgs/:org/projects/:project/editions/:ed/rollback → roll back to a previous build (admin)
 ```
 
 The history endpoint returns a paginated list of builds the edition has pointed to, ordered by position (most recent first). Each entry includes the build reference, timestamp, and position.
+
+The rollback endpoint accepts `{"build": "<base32-id>"}` and reassigns the edition to the specified build, recording a new history entry. The build must appear in the edition's history. Returns the updated edition resource.
 
 The `GET /orgs/:org/projects/:project/editions/:ed` response:
 
@@ -289,6 +339,7 @@ The `GET /orgs/:org/projects/:project/editions/:ed` response:
   "project_url": "https://docverse.../orgs/rubin/projects/pipelines",
   "build_url": "https://docverse.../orgs/rubin/projects/pipelines/builds/01HQ-3KBR-T5GN-8W",
   "history_url": "https://docverse.../orgs/rubin/projects/pipelines/editions/__main/history",
+  "rollback_url": "https://docverse.../orgs/rubin/projects/pipelines/editions/__main/rollback",
   "published_url": "https://pipelines.lsst.io/",
   "slug": "__main",
   "kind": "main",

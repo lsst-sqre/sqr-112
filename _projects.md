@@ -167,13 +167,36 @@ Two concepts govern edition behavior:
 
 Editions are identified by URL-safe slugs. The slug system has three layers:
 
-1. **Reserved slugs**: `__main` is the sole reserved slug, representing the default edition that serves at the project root (no `/v/` prefix in the URL). It does not correspond to a git ref and uses double-underscore prefix to avoid collisions with any git branch or tag name.
+1. **Reserved slugs**: `__main` is the sole reserved slug, representing the default edition that serves at the project root (no `/v/` prefix in the URL). It does not correspond to a git ref and uses double-underscore prefix to avoid collisions with any git branch or tag name. The `__main` edition is auto-created when the project is created (see {ref}`auto-creation-main-edition` below), not when the first build arrives.
 
 2. **Org-configurable rewrite rules**: organizations can configure pattern-based transforms from git ref → edition slug. These are an ordered list of rules where the first match wins, with three rule types: `prefix_strip`, `regex`, and `ignore`. For example, Rubin's convention uses a `prefix_strip` rule to rewrite `tickets/DM-12345` → slug `DM-12345`. See the {ref}`edition-slug-rewrite-rules` section for the full rule format, evaluation algorithm, and examples.
 
 3. **Default behavior**: slashes in git refs become dashes (e.g., `feature/dark-mode` → `feature-dark-mode`), keeping all edition slugs as single URL path segments.
 
 An edition tracks a **slug**, not a single canonical git ref. Multiple git refs can map to the same slug through rewrite rules and all contribute builds to that edition. For example, if both `tickets/DM-12345` and `DM-12345` exist as branches and both rewrite to slug `DM-12345`, builds from either ref update the same edition. This fixes a bug in LTD Keeper where only one ref could contribute to a special-case edition.
+
+(default-edition-config)=
+
+### Default edition configuration
+
+When a project is created, its `__main` edition needs a tracking mode and parameters. The `DefaultEditionConfig` model defines this configuration:
+
+| Field             | Type              | Default       | Description                                                  |
+| ----------------- | ----------------- | ------------- | ------------------------------------------------------------ |
+| `tracking_mode`   | TrackingMode      | `git_ref`     | How the default edition tracks builds                         |
+| `tracking_params` | object (nullable) | `null`        | Mode-specific parameters (defaults to `{"git_ref": "main"}` at the service layer when `null` and mode is `git_ref`) |
+| `title`           | string            | `"Main"`      | Display title for the default edition                         |
+| `lifecycle_exempt` | bool             | `true`        | Whether the default edition is exempt from lifecycle rules    |
+
+#### Configuration precedence
+
+The default edition configuration follows a three-tier precedence chain, resolved at project creation time:
+
+1. **Request-level**: the `default_edition` field on the `ProjectCreate` request body. When provided, this takes priority.
+2. **Organization-level**: the `default_edition_config` JSONB column on the organization. Used when the request omits `default_edition`.
+3. **Hardcoded fallback**: `git_ref` tracking the `main` branch, title `"Main"`, `lifecycle_exempt=true`. Used when neither the request nor the organization provides a config.
+
+This precedence chain means organizations can set a single default (e.g., tracking `develop` instead of `main`) without requiring every project creation request to specify it, while individual projects can still override when needed.
 
 (edition-slug-rewrite-rules)=
 
@@ -405,6 +428,18 @@ The full set of tracking modes in Docverse:
 
 Semver tracking supports tags both with and without a `v` prefix (e.g., `v2.1.0` and `2.1.0`).
 
+#### Edition matching query strategy
+
+When a build completes, the build processing worker must determine which editions should be updated. The edition matching query implements this in two phases:
+
+1. **Broad SQL query**: fetch all non-deleted editions for the build's project, ordered by slug. No SQL-level filtering on tracking mode or params is applied.
+2. **Application-level filtering**: iterate over the result set and match each edition against the build's `git_ref` and `alternate_name`:
+   - **`git_ref` editions** match when the build has no `alternate_name` and the edition's `tracking_params.git_ref` equals the build's `git_ref`.
+   - **`alternate_git_ref` editions** match when the build has an `alternate_name` and the edition's `tracking_params` match both the `git_ref` and `alternate_name`.
+   - Other tracking modes (semver, EUPS, etc.) apply their own comparison logic against the build's git ref.
+
+The two-phase approach is deliberate. Tracking params are stored as JSONB, and the matching logic varies by tracking mode — semver modes require version comparison, EUPS modes require tag pattern parsing, and so on. Fetching all project editions and filtering in application code keeps the query simple and the matching logic centralized, while the dataset per project is small enough (typically tens to low hundreds of editions) that the approach scales well without index optimization.
+
 #### The `alternate_git_ref` tracking mode
 
 The `alternate_git_ref` mode is the dedicated tracking mode for deployment-scoped editions. It matches builds by **both** a specific `git_ref` **and** an `alternate_name`, parameterized via `tracking_params`. For example, edition `usdf-dev--DM-12345` uses `alternate_git_ref` with `tracking_params: {"git_ref": "tickets/DM-12345", "alternate_name": "usdf-dev"}` — it updates only when a build arrives carrying that exact git ref and alternate name pair.
@@ -429,6 +464,23 @@ When an edition is auto-created, its kind is assigned based on the tracking mode
 `alternate` editions are exempt from `draft_inactivity` lifecycle rules by default — they represent long-lived deployment targets, not transient branches. Alternate editions can be created manually via the API, or auto-created when builds carry an `alternate_name` (see below). Slug rewrite rules can also assign `edition_kind: "alternate"` to control the kind assigned during auto-creation.
 
 ### Auto-creation of editions
+
+There are two auto-creation contexts: project creation and build processing.
+
+(auto-creation-main-edition)=
+
+#### Auto-creation on project creation
+
+When a new project is created via `POST /orgs/:org/projects`, the project service automatically creates the project's `__main` edition alongside the project record. The `__main` edition is created with:
+
+- **Slug**: `__main` (the reserved system slug)
+- **Kind**: `main`
+- **`lifecycle_exempt`**: `true` (the `__main` edition is never cleaned up by lifecycle rules)
+- **Tracking mode and params**: determined by the {ref}`default-edition-config` precedence chain
+
+Because the `__main` slug starts with `__` (the reserved prefix), it cannot be created through the normal edition creation request model, whose slug validation requires the pattern `^[a-z0-9][a-z0-9-]*[a-z0-9]$`. Instead, the edition store provides an internal creation method that bypasses slug validation for system-created editions. This method accepts raw field values rather than a validated edition creation model, allowing slugs that violate the user-facing constraints. The public edition creation path (used by the API endpoint for user-created editions) continues to enforce the slug pattern, so users cannot create `__`-prefixed editions.
+
+#### Auto-creation on build processing
 
 When a new build arrives and matches no existing edition's tracking criteria, Docverse can auto-create editions:
 
@@ -460,6 +512,17 @@ Docverse maintains an explicit log of every build that an edition has pointed to
 - **Orphan build detection**: lifecycle rules can reference history position (e.g., "a build that is 5+ versions back and older than 30 days is an orphan").
 
 See {ref}`table-edition-build-history` for the column definition.
+
+#### Position management algorithm
+
+When a new build is recorded in an edition's history, positions are managed with a shift-then-insert approach:
+
+1. **Shift existing entries**: a single `UPDATE` increments the `position` column by 1 for all rows with the given `edition_id`. This pushes all existing entries down (position 1 becomes 2, position 2 becomes 3, etc.).
+2. **Insert new entry**: a new row is inserted with `position=1`, marking it as the most recent build for this edition.
+
+This ensures that position 1 always represents the current build and positions increase monotonically for older entries. The `position` value directly corresponds to "how many builds ago" — position 1 is the current build, position 5 means four builds have been published since this one.
+
+The shift-then-insert approach uses a bulk `UPDATE` rather than per-row manipulation, keeping the operation efficient even for editions with long histories. The `build_history_orphan` lifecycle rule references positions directly (e.g., "delete builds at position 5+ that are older than 30 days"), making the position semantics load-bearing for lifecycle evaluation.
 
 (edition-update-strategy)=
 ### Edition update strategy

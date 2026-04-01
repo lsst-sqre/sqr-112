@@ -36,6 +36,7 @@ erDiagram
         string root_path_prefix
         JSONB slug_rewrite_rules
         JSONB lifecycle_rules
+        JSONB default_edition_config
         string publishing_store_label
         string staging_store_label
         string cdn_service_label
@@ -191,6 +192,7 @@ See {ref}`organizations` for the full behavioral design.
 | `root_path_prefix`      | str               | Path prefix for path-prefix URL scheme (e.g., `/documentation/`) |
 | `slug_rewrite_rules`    | JSONB             | Ordered list of edition slug rewrite rules (see {ref}`edition-slug-rewrite-rules`) |
 | `lifecycle_rules`       | JSONB             | Default lifecycle rules for projects in this org (see {ref}`projects`) |
+| `default_edition_config` | JSONB (nullable) | Default `DefaultEditionConfig` for the `__main` edition on new projects (see {ref}`default-edition-config`) |
 | `publishing_store_label` | str (nullable)   | Label of the `object_storage` service used as the publishing store |
 | `staging_store_label`   | str (nullable)    | Label of the `object_storage` service used for staging uploads |
 | `cdn_service_label`     | str (nullable)    | Label of the `cdn` service used for cache purging and edge data |
@@ -370,6 +372,8 @@ See {ref}`projects` for the rollback API and how lifecycle rules reference histo
 | `build_id`   | FK → Build     | The build that was served |
 | `position`   | int            | Ordering position (1 = most recent) |
 | `date_created` | datetime     | When this history entry was recorded |
+
+Position 1 is always the most recent build. When a new history entry is recorded, all existing positions for that edition are shifted up by 1 (via a bulk `UPDATE`) before the new entry is inserted at position 1. See {ref}`projects` for the full algorithm.
 
 (table-dashboard-template)=
 

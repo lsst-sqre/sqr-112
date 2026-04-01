@@ -32,6 +32,7 @@ Each organization owns:
 - **Dashboard templates**: a GitHub repo containing Jinja templates and assets, configured at the org level with optional per-project overrides. See the [Dashboard Templating System section](#dashboards) for full details.
 - **Edition slug rewrite rules**: an ordered list of rules that transform git refs into edition slugs. Configured at the org level with optional per-project overrides. See the {ref}`edition-slug-rewrite-rules` section for the full rule format.
 - **Default edition lifecycle rules** ({ref}`projects`).
+- **Default edition configuration** (`default_edition_config`): a JSONB object that sets default tracking behavior for the `__main` edition auto-created on every new project. When a project creation request omits its own default edition configuration, the organization's `default_edition_config` is used. See {ref}`default-edition-config` in the projects section for the full precedence chain and model definition.
 
 (org-infrastructure)=
 
