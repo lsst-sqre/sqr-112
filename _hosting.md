@@ -94,15 +94,39 @@ The Worker also handles routing to the project dashboard page (and other Docvers
 
 #### Cloudflare configuration
 
+##### Software and deployment separation
+
 The Worker codebase lives in the Docverse monorepo under `cloudflare-worker/`, co-located with the Python server and client packages.
 This co-location ensures that changes to the KV key/value schema (written by the Python publisher, read by the Worker) land in the same commit, preventing contract drift.
-The `cloudflare-worker/` directory is a self-contained TypeScript project with its own `package.json`, `tsconfig.json`, and `wrangler.toml`.
+The `cloudflare-worker/` directory is a self-contained TypeScript project with its own `package.json`, `tsconfig.json`, and a minimal `wrangler.toml`.
+
+The `wrangler.toml` committed to the Docverse repo defines only the **software-level defaults** — the entry point, compatibility date, and binding names — without any org-specific configuration:
+
+```toml
+name = "docverse-router"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+```
+
+Per-organization configuration (routes, KV namespace IDs, R2 bucket names, `URL_SCHEME`) lives in a separate **deployment repository** (`lsst-sqre/docverse-cloudflare-deployments` for Rubin Observatory).
+This mirrors the separation between the Docverse server repo and Phalanx for Kubernetes deployments: the software repo owns the code, the deployment repo owns the configuration.
+
+The deployments repo:
+
+- Defines per-org `wrangler.toml` environment blocks with routes, KV/R2 bindings, and environment variables.
+- Pins a specific ref of the Docverse repo to control when Worker code changes roll out.
+- Provides a GitHub Actions workflow that checks out both repos, overlays the per-org config, and runs `wrangler deploy --env <org>`.
+- Serves as a reference template for other institutions setting up Cloudflare Workers for their own Docverse organizations.
+
+Deployments are triggered either by a push to the deployments repo (config change) or by a repository dispatch event from the Docverse repo (Worker code change).
 
 ##### Per-organization Wrangler environments
 
-Each Docverse organization gets its own [Wrangler environment](https://developers.cloudflare.com/workers/wrangler/environments/), providing complete isolation of routes, KV namespaces, and R2 buckets.
+Each Docverse organization gets its own [Wrangler environment](https://developers.cloudflare.com/workers/wrangler/environments/) in the deployments repo, providing complete isolation of routes, KV namespaces, and R2 buckets.
 This model ensures that a subdomain-based organization only receives subdomain traffic, a path-prefix organization only receives path-prefix traffic, and each organization's KV and R2 bindings are fully independent.
 Deploying to a specific organization uses `wrangler deploy --env <org-env>`.
+
+An example deployments-repo `wrangler.toml` for Rubin Observatory's organizations:
 
 ```toml
 name = "docverse-router"
