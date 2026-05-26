@@ -6,6 +6,8 @@ For users, LTD's design ensures documentation is served directly through a CDN a
 For project staff, LTD provides a seamless experience for integrating documentation hosting with their development and deployment workflows.
 When new branches or tags are pushed to a project, LTD creates documentation editions for those corresponding versions automatically.
 
+This is a test change.
+
 ### Lessons learned from LTD
 
 After a decade of operating LTD, though, we have identified a number of area where we either wish to improve the platform, or resolve issues or limitations in the existing implementation:
