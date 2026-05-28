@@ -29,7 +29,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Build technote
-        run: uv run tox run -e html
+        run: uvx tox run -e html
 
       - name: Upload to Docverse
         id: docverse
