@@ -46,3 +46,4 @@ jobs:
           echo "build-url: ${{ steps.docverse.outputs.build-url }}"
           echo "published-url: ${{ steps.docverse.outputs.published-url }}"
           echo "job-status: ${{ steps.docverse.outputs.job-status }}"
+          echo "publish-status: ${{ steps.docverse.outputs.publish-status }}"
