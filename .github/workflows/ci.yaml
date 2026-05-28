@@ -11,39 +11,5 @@ jobs:
       ltd_username: ${{ secrets.LTD_USERNAME }}
       ltd_password: ${{ secrets.LTD_PASSWORD }}
 
-  docverse-upload:
-    # Test uploading the build to the Docverse dev server.
-    needs: call-workflow
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0 # full history for metadata
-          submodules: true
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-
-      - name: Build technote
-        run: uvx tox run -e html
-
-      - name: Upload to Docverse
-        id: docverse
-        uses: lsst-sqre/docverse-upload@tickets/DM-54686
-        with:
-          org: jsc-test-20260409
-          project: sqr-112
-          dir: _build/html
-          token: ${{ secrets.DOCVERSE_TOKEN }}
-          base-url: https://roundtable-dev.lsst.cloud/docverse/api
-
-      - name: Report Docverse build
-        run: |
-          echo "build-url: ${{ steps.docverse.outputs.build-url }}"
-          echo "published-url: ${{ steps.docverse.outputs.published-url }}"
-          echo "job-status: ${{ steps.docverse.outputs.job-status }}"
-          echo "publish-status: ${{ steps.docverse.outputs.publish-status }}"
+  # The Docverse upload demo lives in its own workflow (docverse-demo.yaml) so it
+  # runs independently of the legacy LTD keeper path in call-workflow.
