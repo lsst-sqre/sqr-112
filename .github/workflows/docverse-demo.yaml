@@ -15,6 +15,10 @@ concurrency:
   group: docverse-demo-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   docverse-upload:
     runs-on: ubuntu-latest
@@ -39,6 +43,7 @@ jobs:
           dir: _build/html
           token: ${{ secrets.DOCVERSE_TOKEN }}
           base-url: https://roundtable-dev.lsst.cloud/docverse/api
+          github-token: ${{ github.token }}
 
       - name: Report Docverse build
         run: |
