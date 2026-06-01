@@ -53,6 +53,8 @@ Usage with PR comments enabled:
     github-token: ${{ github.token }}
 ```
 
+Set `comment-on-pr: false` to keep uploading while silencing the PR comment — useful for a dev-server workflow that should gather build data without commenting on pull requests.
+
 ### Inputs
 
 | Input            | Required | Default                    | Description                                   |
@@ -66,6 +68,7 @@ Usage with PR comments enabled:
 | `alternate-name` | no       | —                          | Alternate name for scoped editions            |
 | `wait`           | no       | `true`                     | Wait for processing to complete               |
 | `github-token`   | no       | —                          | GitHub token for posting PR comments with links to updated editions. Typically `${{ github.token }}`. When omitted, PR commenting is disabled. |
+| `comment-on-pr`  | no       | `true`                     | Post the PR comment (`true`/`false`). When `false`, commenting is disabled even if `github-token` is set — for dev-server workflows that should keep uploading but stay silent on PRs. |
 
 ### Outputs
 
@@ -97,7 +100,7 @@ How the action finds the PR number depends on the workflow trigger event:
 The comment uses a Markdown table to list all updated editions with their published URLs:
 
 ````markdown
-<!-- docverse:pr-comment:rubin/pipelines -->
+<!-- docverse:pr-comment:roundtable.lsst.cloud:rubin/pipelines -->
 ### Docverse documentation preview
 
 | Edition | URL |
@@ -113,7 +116,7 @@ For partial failures (job status `completed_with_errors`), successful editions a
 
 #### Comment deduplication
 
-A hidden HTML marker `<!-- docverse:pr-comment:{org}/{project} -->` at the top of the comment body identifies the comment, scoped by organization and project.
+A hidden HTML marker `<!-- docverse:pr-comment:{host}:{org}/{project} -->` at the top of the comment body identifies the comment, scoped by server host, organization, and project.
 On each build the action:
 
 1. Lists existing comments on the PR and searches for the marker.
@@ -121,6 +124,10 @@ On each build the action:
 3. If not found: creates a new comment via `POST /repos/{owner}/{repo}/issues/{pr_number}/comments`.
 
 Multi-project PRs (repositories that publish to multiple Docverse projects) get one comment per project, each independently updated.
+
+The `{host}` segment (`new URL(base-url).host`, including any port) scopes the marker to a single Docverse deployment.
+This matters during development, when the same repository and PR commonly upload to **both** a dev Docverse server and the production org under the same `{org}/{project}` slug.
+Without the host in the marker the two builds would target the same comment and clobber each other on every run; with it, the dev-server and production comments coexist as two separate, independently-updated comments.
 
 #### Edge cases
 
