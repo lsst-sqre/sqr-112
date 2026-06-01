@@ -32,7 +32,7 @@ jobs:
 
       - name: Upload to Docverse
         id: docverse
-        uses: lsst-sqre/docverse-upload@tickets/DM-54686
+        uses: lsst-sqre/docverse-upload@tickets/DM-54687
         with:
           org: jsc-test-20260409
           project: sqr-112
