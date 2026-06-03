@@ -36,6 +36,10 @@ For a decade, Rubin Observatory has hosted its documentation sites with its LSST
 
 ```
 
+```{include} _metrics.md
+
+```
+
 ```{include} _api.md
 
 ```
