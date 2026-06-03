@@ -1,0 +1,53 @@
+name: Docverse demo
+
+# Dedicated workflow for exercising the lsst-sqre/docverse-upload action against
+# the Docverse dev server. Unlike the `docverse-upload` job in ci.yaml, this does
+# NOT depend on the reusable `call-workflow` (legacy LTD keeper) job, so it runs
+# independently of LTD keeper availability — handy when call-workflow flakes.
+
+'on':
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: docverse-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  docverse-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history for metadata
+          submodules: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Build technote
+        run: uvx tox run -e html
+
+      - name: Upload to Docverse
+        id: docverse
+        uses: lsst-sqre/docverse-upload@main
+        with:
+          org: jsc-test-20260409
+          project: sqr-112
+          dir: _build/html
+          token: ${{ secrets.DOCVERSE_TOKEN }}
+          base-url: https://roundtable-dev.lsst.cloud/docverse/api
+          github-token: ${{ github.token }}
+
+      - name: Report Docverse build
+        run: |
+          echo "build-url: ${{ steps.docverse.outputs.build-url }}"
+          echo "published-url: ${{ steps.docverse.outputs.published-url }}"
+          echo "job-status: ${{ steps.docverse.outputs.job-status }}"
+          echo "publish-status: ${{ steps.docverse.outputs.publish-status }}"

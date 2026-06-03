@@ -10,3 +10,6 @@ jobs:
     secrets:
       ltd_username: ${{ secrets.LTD_USERNAME }}
       ltd_password: ${{ secrets.LTD_PASSWORD }}
+
+  # The Docverse upload demo lives in its own workflow (docverse-demo.yaml) so it
+  # runs independently of the legacy LTD keeper path in call-workflow.
