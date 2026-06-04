@@ -405,19 +405,26 @@ Tracks all background jobs as the single source of truth for job state and progr
 The queue backend (Arq/Redis) handles delivery; this table is the authoritative state store.
 See {ref}`queue` for progress tracking, cross-job serialization, and operator queries.
 
-| Column           | Type                    | Description |
-| ---------------- | ----------------------- | ----------- |
-| `id`             | int                     | Internal primary key |
-| `public_id`      | int                     | Crockford Base32 serialized in API |
-| `backend_job_id` | str (nullable)          | Reference to the queue backend's job ID (e.g., Arq UUID) |
-| `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup`, `credential_reencrypt` |
-| `status`         | enum                    | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled` |
-| `phase`          | str (nullable)          | Current processing phase (e.g., `inventory`, `tracking`, `editions`, `dashboard`) |
-| `org_id`         | FK → Organization       | Scoped to org for filtering |
-| `project_id`     | FK → Project (nullable) | Set for build/edition jobs |
-| `build_id`       | FK → Build (nullable)   | Set for build processing jobs |
-| `progress`       | JSONB (nullable)        | Structured progress data, phase-specific |
-| `errors`         | JSONB (nullable)        | Collected error details |
-| `date_created`   | datetime                | When the job was enqueued |
-| `date_started`   | datetime (nullable)     | When a worker picked it up |
-| `date_completed` | datetime (nullable)     | When the job finished |
+| Column                  | Type                             | Description |
+| ----------------------- | -------------------------------- | ----------- |
+| `id`                    | int                              | Internal primary key |
+| `public_id`             | int                              | Crockford Base32 serialized in API |
+| `backend_job_id`        | str (nullable)                   | Reference to the queue backend's job ID (e.g., Arq UUID) |
+| `kind`                  | str                              | Tracked kinds: `build_processing`, `publish_edition`, `dashboard_build`, `dashboard_sync`, `keeper_sync_run_discovery`, `keeper_sync_project`, `lifecycle_eval`, `git_ref_audit`. The `JobKind` enum also keeps the legacy `edition_update` (renamed to `publish_edition`) and reserves `purgatory_cleanup` / `credential_reencrypt` for planned jobs |
+| `status`                | enum                             | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled` |
+| `phase`                 | str (nullable)                   | Current processing phase, job-specific (e.g., `unpacking`, `uploading`, `edition_tracking`, `publishing`, `rendering`, `complete`) |
+| `org_id`                | FK → Organization                | Scoped to org for filtering |
+| `project_id`            | FK → Project (nullable)          | Set for build / publish / dashboard jobs |
+| `build_id`              | FK → Build (nullable)            | Set for build processing jobs |
+| `edition_id`            | FK → Edition (nullable)          | Set for `publish_edition` jobs |
+| `keeper_sync_run_id`    | FK → KeeperSyncRun (nullable)    | Parent keeper-sync run, `ON DELETE SET NULL` |
+| `lifecycle_eval_run_id` | FK → LifecycleEvalRun (nullable) | Parent lifecycle-eval run, `ON DELETE SET NULL` |
+| `git_ref_audit_run_id`  | FK → GitRefAuditRun (nullable)   | Parent git-ref-audit run, `ON DELETE SET NULL` |
+| `subject_label`         | str (nullable)                   | Operator-readable subject for fan-out children (LTD slug for `keeper_sync_project`; org slug for `lifecycle_eval` / `git_ref_audit`) |
+| `progress`              | JSONB (nullable)                 | Structured progress data, phase-specific |
+| `errors`                | JSONB (nullable)                 | Collected error details |
+| `date_created`          | datetime                         | When the job was enqueued |
+| `date_started`          | datetime (nullable)              | When a worker picked it up |
+| `date_completed`        | datetime (nullable)              | When the job finished |
+
+Partial unique indexes enforce per-resource mutual exclusion on active (`queued`/`in_progress`) rows: `(org_id, subject_label)` for `keeper_sync_project`, `(org_id, project_id)` for `dashboard_build`, and `org_id` alone for `lifecycle_eval` and `git_ref_audit`. Terminal rows fall out of each partial index, so a finished job never blocks a fresh enqueue. See {ref}`queue` for the fan-out and reaper design.

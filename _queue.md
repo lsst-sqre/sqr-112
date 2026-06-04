@@ -4,30 +4,70 @@
 
 ### Design philosophy
 
-Docverse interacts with the job queue through a **backend-agnostic abstraction layer** (see {ref}`queue-backend-protocol`). The initial implementation uses [Arq](https://arq-docs.helpmanual.io/) via [Safir's ArqQueue](https://safir.lsst.io/) with Redis as the message transport. The queue backend handles delivery, retries, and worker dispatch. All orchestration and parallelism within a job is handled by Docverse's service layer using standard Python asyncio. This minimizes coupling to any specific queue technology and keeps the business logic testable with plain async functions.
+Docverse interacts with the job queue through a **backend-agnostic abstraction layer** (see {ref}`queue-backend-protocol`). The implementation uses [Arq](https://arq-docs.helpmanual.io/) via [Safir's ArqQueue](https://safir.lsst.io/) with Redis as the message transport. The queue backend handles delivery, retries, and worker dispatch. Orchestration and parallelism within a job are handled by Docverse's service layer using standard Python asyncio. This minimizes coupling to any specific queue technology and keeps the business logic testable with plain async functions.
 
-Each user-facing operation that triggers background work results in a **single background job**. The job's worker function calls through the service layer, which coordinates the steps internally. Where steps are independent, the service layer uses `asyncio.gather()` to parallelize them.
+Docverse uses two complementary job-composition patterns:
+
+- **Single self-contained jobs.** A user-facing operation that triggers a bounded unit of work runs as one background job whose worker function calls through the service layer. Where steps are independent, the service layer uses `asyncio.gather()` to parallelize them within the job.
+- **Fan-out jobs.** Operations that spread across many independent resources — processing a build that updates several editions, sweeping every organization for lifecycle violations, backfilling an entire LTD instance — run as a small **parent/dispatcher** job that enqueues one **child job per resource**. Each child is independently retryable, holds its own advisory lock, and records its own progress. A parent *run* row aggregates the children's outcomes. This pattern keeps individual jobs small and bounded, isolates per-resource failures, and lets the queue backend schedule the children across workers. Fan-out replaced the earlier "one big job that does everything with `asyncio.gather()` internally" model: for example, `build_processing` now enqueues a separate `publish_edition` child per affected edition instead of publishing them all inline (see {ref}`job-types`).
+
+(worker-pools)=
+
+### Worker pools and queues
+
+Docverse runs **three independent Arq worker pools**, each bound to its own Redis queue and tagged with its own Sentry component. Splitting the workers across queues isolates workloads so a burst on one cannot starve the others: a noisy LTD backfill cannot delay a user's build, and a slow lifecycle sweep cannot delay an edition publish.
+
+| Pool (`WorkerSettings`)        | Queue name                  | Sentry component        | Jobs hosted                                                                                                                                              |
+| ------------------------------ | --------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Default**                    | `docverse:queue`            | `worker`                | `build_processing`, `publish_edition`, `dashboard_build`, `dashboard_sync`, `project_github_resolve`, `ping`                                              |
+| **Keeper-sync**                | `docverse:sync-queue`       | `worker-keeper-sync`    | `keeper_sync_run_discovery`, `keeper_sync_project`, `keeper_sync_reaper`, `keeper_sync_tier_main`, `keeper_sync_tier_discovery`, `keeper_sync_tier_other` |
+| **Lifecycle**                  | `docverse:lifecycle-queue`  | `worker-lifecycle-eval` | `lifecycle_eval_dispatcher`, `lifecycle_eval`, `git_ref_audit_discovery`, `git_ref_audit`, `lifecycle_reaper`, and the run-less reaper backstops          |
+
+The **default** pool carries the latency-sensitive user-facing work (build processing, edition publishing, dashboard rendering). The **keeper-sync** pool is reserved for the LTD migration so a large backfill cannot compete with live publishing (see {ref}`migration`). The **lifecycle** pool carries the periodic maintenance fan-outs (`lifecycle_eval`, `git_ref_audit`) plus, as a deliberate placement, the cron-driven **reaper backstops** for the default-pool kinds — reaper sweeps are light and infrequent, and hosting them here keeps them off the latency-sensitive default pool. (The pool keeps its `lifecycle` lineage in code even though it now hosts more than lifecycle work; a rename is tracked separately.)
+
+All three pools share the same startup/shutdown hooks and the same `WorkerFactoryBuilder`, so every worker — regardless of queue — sees one consistent dependency graph.
 
 ### QueueJob table
 
-Docverse maintains its own `QueueJob` table in Postgres as the single source of truth for job state and progress. This table serves the user-facing queue API, operator dashboards, and internal coordination (e.g., detecting conflicting concurrent edition updates). The queue backend's internal state is not queried directly for status — Docverse treats the backend as a delivery mechanism only. See {ref}`table-queue-job` in the database schema section for the column reference within the full schema.
+Docverse maintains its own `queue_jobs` table in Postgres as the single source of truth for job state and progress. This table serves the user-facing queue API, operator dashboards, and internal coordination. The queue backend's internal state is not queried for status — Docverse treats the backend as a delivery mechanism only. See {ref}`table-queue-job` in the database schema section for the column reference within the full schema.
 
-| Column           | Type                    | Description                                                                                                    |
-| ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `id`             | int                     | Internal PK                                                                                                    |
-| `public_id`      | int                     | Crockford Base32 serialized in API                                                                             |
-| `backend_job_id` | str (nullable)          | Reference to the queue backend's job ID (e.g., Arq UUID)                                                       |
-| `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup`, `inventory_census`, `credential_reencrypt` |
-| `status`         | enum                    | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled`                           |
-| `phase`          | str (nullable)          | Current phase: `inventory`, `tracking`, `editions`, `dashboard`                                                |
-| `org_id`         | FK → Organization       | Scoped to org (for operator filtering)                                                                         |
-| `project_id`     | FK → Project (nullable) | Set for build/edition jobs                                                                                     |
-| `build_id`       | FK → Build (nullable)   | Set for build processing jobs                                                                                  |
-| `progress`       | JSONB (nullable)        | Structured progress data, phase-specific                                                                       |
-| `errors`         | JSONB (nullable)        | Collected error details                                                                                        |
-| `date_created`   | datetime                | When enqueued                                                                                                  |
-| `date_started`   | datetime (nullable)     | When a worker picked it up                                                                                     |
-| `date_completed` | datetime (nullable)     | When finished                                                                                                  |
+| Column                  | Type                          | Description                                                                                                                                  |
+| ----------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                    | int                           | Internal PK                                                                                                                                  |
+| `public_id`             | int                           | Crockford Base32 serialized in API                                                                                                           |
+| `backend_job_id`        | str (nullable)                | Reference to the queue backend's job ID (e.g., Arq UUID)                                                                                     |
+| `kind`                  | str                           | Job kind — see the enum below                                                                                                                |
+| `status`                | enum                          | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled`                                                         |
+| `phase`                 | str (nullable)                | Current phase, job-specific (e.g., `unpacking`, `uploading`, `edition_tracking`, `publishing`, `rendering`, `complete`)                      |
+| `org_id`                | int                           | Owning org (for operator filtering)                                                                                                          |
+| `project_id`            | int (nullable)                | Set for build / publish / dashboard jobs                                                                                                     |
+| `build_id`              | int (nullable)                | Set for build processing jobs                                                                                                                |
+| `edition_id`            | FK → Edition (nullable)       | Set for `publish_edition` jobs                                                                                                               |
+| `keeper_sync_run_id`    | FK → KeeperSyncRun (nullable) | Set for jobs belonging to a keeper-sync run (`ON DELETE SET NULL`)                                                                           |
+| `lifecycle_eval_run_id` | FK → LifecycleEvalRun (nullable) | Set for the per-org children of a lifecycle-eval run (`ON DELETE SET NULL`)                                                               |
+| `git_ref_audit_run_id`  | FK → GitRefAuditRun (nullable) | Set for the per-org children of a git-ref-audit run (`ON DELETE SET NULL`)                                                                  |
+| `subject_label`         | str (nullable)                | Operator-readable subject for fan-out children (the LTD slug for `keeper_sync_project`; the org slug for `lifecycle_eval` / `git_ref_audit`) |
+| `progress`              | JSONB (nullable)              | Structured progress data, phase-specific                                                                                                     |
+| `errors`                | JSONB (nullable)              | Collected error details                                                                                                                      |
+| `date_created`          | datetime                      | When enqueued                                                                                                                                |
+| `date_started`          | datetime (nullable)           | When a worker picked it up                                                                                                                   |
+| `date_completed`        | datetime (nullable)           | When finished                                                                                                                                |
+
+The `kind` values that get a tracked `queue_jobs` row are:
+
+`build_processing`, `publish_edition`, `dashboard_build`, `dashboard_sync`, `keeper_sync_run_discovery`, `keeper_sync_project`, `lifecycle_eval`, `git_ref_audit`.
+
+The `JobKind` enum also retains the legacy value `edition_update` (the former name for what is now `publish_edition`; see {ref}`job-publish-edition`) and reserves `purgatory_cleanup` and `credential_reencrypt` for **planned** periodic jobs not yet implemented (see {ref}`planned-periodic-jobs`). The orchestration functions — the keeper-sync tier crons, the `lifecycle_eval_dispatcher`, the `git_ref_audit_discovery` tick, the reapers, plus the lightweight `project_github_resolve` and `ping` jobs — are Arq functions that do **not** create `queue_jobs` rows; their effect is the *child* jobs they enqueue and the *run* rows they manage.
+
+#### Run tables
+
+Fan-out subsystems track an overall pass with a dedicated **run** row, and attribute each child `queue_jobs` row to it through the matching nullable FK above:
+
+- `keeper_sync_runs` — one row per operator-triggered LTD backfill (see {ref}`job-keeper-sync`).
+- `lifecycle_eval_runs` — one row per hourly lifecycle-eval dispatcher tick.
+- `git_ref_audit_runs` — one row per daily git-ref-audit discovery tick.
+
+Run rows deliberately do **not** denormalize per-child counters. Progress is derived on read by aggregating the child `queue_jobs` rows filtered on the run FK (`GROUP BY status`), so there is exactly one source of truth for child state and no counter to keep in sync. A run finalizes — transitioning to `succeeded`, `partial_failure`, or `failed` — once all of its children have reached a terminal status (see {ref}`reaper-pattern`).
 
 (queue-backend-protocol)=
 
@@ -81,7 +121,7 @@ class QueueBackend(Protocol):
 
 #### Implementations
 
-**`ArqQueueBackend`** wraps Safir's `ArqQueue` for production use. Arq uses UUID strings as job IDs, which are stored in the `backend_job_id` column of the `QueueJob` table. The worker functions are standard async functions that receive the job payload and call through the service layer.
+**`ArqQueueBackend`** wraps Safir's `ArqQueue` for production use. Arq uses UUID strings as job IDs, which are stored in the `backend_job_id` column of the `queue_jobs` table. The `enqueue` call accepts a `queue_name`, so the same backend can dispatch to any of the three queues ({ref}`worker-pools`). The worker functions are standard async functions that receive the job payload and call through the service layer.
 
 **`MockQueueBackend`** wraps Safir's `MockArqQueue` for testing. Jobs are executed in-process, making tests deterministic without requiring a running Redis instance.
 
@@ -89,345 +129,305 @@ Both implementations are constructed by the factory and injected into services, 
 
 #### Infrastructure
 
-Arq requires a **Redis** instance as its message broker. In Phalanx deployments, Redis is a standard in-cluster service. The `QueueJob` Postgres table remains the authoritative state store — Redis holds only transient message data. If Redis state is lost, in-flight jobs can be re-enqueued from `QueueJob` records with `status = 'queued'`.
+Arq requires a **Redis** instance as its message broker. In Phalanx deployments, Redis is a standard in-cluster service. The `queue_jobs` Postgres table remains the authoritative state store — Redis holds only transient message data. If Redis state is lost, in-flight jobs can be re-enqueued from `queue_jobs` records with `status = 'queued'`, and the reapers ({ref}`reaper-pattern`) finalize any row whose backend job vanished.
 
 ### Progress tracking
 
-The service layer writes progress to the `QueueJob` table at each phase transition and within phases where granular tracking is useful. These are lightweight single-row UPDATEs.
+Each worker writes progress to its own `queue_jobs` row at phase transitions and at points where granular tracking is useful. These are lightweight single-row UPDATEs through the `QueueJobStore`.
 
 #### Phase transitions
 
-At each major phase boundary, the service updates the `phase` column and resets/initializes the `progress` JSONB:
+At each phase boundary, the worker updates the `phase` column and writes phase-appropriate `progress` JSONB. For example, `build_processing` walks `unpacking → uploading → edition_tracking → complete`:
 
 ```python
-await queue_job_store.update_phase(job_id, "inventory")
-await inventory_service.catalog_build(build)
-
-await queue_job_store.update_phase(job_id, "tracking")
-affected_editions = await tracking_service.evaluate(build)
-
-await queue_job_store.start_editions_phase(job_id, affected_editions)
-results = await asyncio.gather(
-    *[self._update_single_edition(e, build, job_id)
-      for e in affected_editions],
-    return_exceptions=True,
+await queue_job_store.update_phase(
+    queue_job_id, "unpacking",
+    progress={"message": "Unpacking build into object store"},
 )
+# ... unpack tarball, upload objects, record inventory ...
 
-await queue_job_store.update_phase(job_id, "dashboard")
-await dashboard_service.render(project)
-
-await queue_job_store.complete(job_id)
-```
-
-#### Live edition progress via conditional JSONB merge
-
-During the editions phase, multiple edition update coroutines run concurrently via `asyncio.gather()`. Each coroutine updates the `progress` JSONB when it completes, using Postgres `jsonb_set` to atomically move its edition slug between the `editions_in_progress` and `editions_completed` (as a structured object including the edition's `published_url`), `editions_skipped`, or `editions_failed` arrays:
-
-```sql
--- Mark edition completed
-UPDATE queue_job
-SET progress = jsonb_set(
-    jsonb_set(
-        progress,
-        '{editions_completed}',
-        (progress->'editions_completed') || :completed_entry::jsonb
-    ),
-    '{editions_in_progress}',
-    (progress->'editions_in_progress') - :edition_slug
+await queue_job_store.update_phase(
+    queue_job_id, "edition_tracking",
+    progress={"message": "Evaluating edition tracking rules"},
 )
-WHERE id = :job_id
+tracking_result = await tracking_service.track_build(build)
+
+# Fan out one publish_edition child per affected edition
+publish_jobs = await _enqueue_publish_jobs(tracking_result, ...)
+
+await queue_job_store.update_phase(queue_job_id, "complete", progress={...})
+await queue_job_store.complete(queue_job_id, has_errors=has_errors)
 ```
 
-Where `completed_entry` is `{"slug": "__main", "published_url": "https://pipelines.lsst.io/"}`.
+#### Build processing progress shape
 
-For failures, the slug is moved to `editions_failed` as a structured object with error context:
-
-```sql
--- Mark edition failed
-UPDATE queue_job
-SET progress = jsonb_set(
-    jsonb_set(
-        progress,
-        '{editions_failed}',
-        (progress->'editions_failed') || :failed_entry::jsonb
-    ),
-    '{editions_in_progress}',
-    (progress->'editions_in_progress') - :edition_slug
-)
-WHERE id = :job_id
-```
-
-Where `failed_entry` is `{"slug": "DM-12345", "error": "R2 timeout after 3 retries"}`.
-
-For skipped editions (superseded by a newer build; see {ref}`cross-job-serialization`), the slug is moved to `editions_skipped` as a structured object with the reason:
-
-```sql
--- Mark edition skipped
-UPDATE queue_job
-SET progress = jsonb_set(
-    jsonb_set(
-        progress,
-        '{editions_skipped}',
-        (progress->'editions_skipped') || :skipped_entry::jsonb
-    ),
-    '{editions_in_progress}',
-    (progress->'editions_in_progress') - :edition_slug
-)
-WHERE id = :job_id
-```
-
-Where `skipped_entry` is `{"slug": "v2.x", "reason": "superseded by build 01HQ-3KBR-T5GN-8W"}`.
-
-Postgres serializes the row locks, but since these are sub-millisecond metadata writes against a single row, contention is negligible compared to the actual edition update work (KV writes, cache purges, or object copies).
-
-The service layer wraps each edition update coroutine:
-
-```python
-async def _update_single_edition(self, edition, build, job_id):
-    try:
-        skipped = await self._edition_service.update(edition, build)
-        if skipped:
-            await self._queue_store.mark_edition_skipped(
-                job_id, edition.slug, reason="superseded"
-            )
-        else:
-            await self._queue_store.mark_edition_completed(
-                job_id, edition.slug, edition.published_url
-            )
-    except Exception as e:
-        await self._queue_store.mark_edition_failed(
-            job_id, edition.slug, str(e)
-        )
-        raise
-```
-
-#### Progress JSONB structure
-
-The `progress` JSONB is phase-specific. During the editions phase:
+Because edition publishing is now fanned out to child jobs, the `build_processing` row's `progress` JSONB records the *outcome of tracking* and a *manifest of the children it spawned*, rather than per-edition publish state:
 
 ```json
 {
-  "editions_total": 3,
-  "editions_completed": [
-    { "slug": "__main", "published_url": "https://pipelines.lsst.io/" }
-  ],
-  "editions_skipped": [
-    { "slug": "v2.x", "reason": "superseded by build 01HQ-3KBR-T5GN-8W" }
-  ],
-  "editions_failed": [
-    { "slug": "DM-12345", "error": "R2 timeout after 3 retries" }
-  ],
-  "editions_in_progress": []
+  "message": "Build processing complete",
+  "object_count": 1247,
+  "total_size_bytes": 184320512,
+  "editions_updated": [{ "slug": "__main", "action": "updated" }],
+  "editions_skipped": [{ "slug": "v2.x" }],
+  "publish_jobs": [
+    { "edition_slug": "__main", "publish_queue_job_public_id": "01HQ-3KBR-T5GN-8W" }
+  ]
 }
 ```
 
-The `editions_skipped` and `editions_failed` arrays already used structured objects with contextual fields (`reason` and `error`, respectively). Promoting `editions_completed` to a structured object with `published_url` makes the shape consistent across all terminal-state arrays and enables clients — particularly the GitHub Action's PR comment feature ({ref}`pr-comments`) — to discover published URLs directly from job progress without additional API calls. The `editions_in_progress` array remains a plain string array since in-progress editions have no published URL yet.
+Each entry in `publish_jobs` points at an independent `publish_edition` child job, whose own `queue_jobs` row carries the publish phase, the CDN sync result, and any failure detail. A superseded build instead records `{"stale_skipped": true, "latest_build_id": …}` and completes without doing any work (see {ref}`cross-job-serialization`). Other jobs use simpler shapes — e.g. `publish_edition` carries `{"message": "Publishing edition"}` during its `publishing` phase, and `dashboard_build` walks `rendering → uploading → complete`.
 
-For other phases, progress can carry simpler metadata (e.g., `{"message": "Cataloging 1,247 objects"}` during inventory).
+#### Aggregating fan-out runs
+
+For fan-out subsystems, operators do not read a single job's progress — they read the *run*. The run's status (and a queued/succeeded/failed breakdown) is computed by aggregating the child `queue_jobs` rows on the run FK:
+
+```sql
+SELECT status, count(*)
+FROM queue_jobs
+WHERE keeper_sync_run_id = :run_id
+GROUP BY status
+```
+
+queued + in-progress children are *pending*, `completed` children *succeeded*, and everything else *failed*; the run finalizes once nothing is pending (see {ref}`reaper-pattern`).
 
 (cross-job-serialization)=
 
 ### Cross-job serialization
 
-Several background jobs can race on the same project's resources. Two rapid build uploads from the same branch can produce two `build_processing` jobs that both try to update the same edition concurrently. A `build_processing` job and a `dashboard_sync` job can both try to write the same project's dashboard files at the same time. An `edition_update` job and a `build_processing` job can both write the same edition's metadata JSON. Since `asyncio.gather()` parallelizes edition updates *within* a job, and multiple workers can process different jobs simultaneously, these concurrent mutations can lead to interleaved KV writes, partial cache purges, torn dashboard HTML, or inconsistent metadata JSON.
+Several background jobs can race on the same project's resources. Two rapid build uploads from the same branch can produce two `build_processing` jobs for the same `(project, git_ref)`. A `publish_edition` job and another `publish_edition` job (one build-driven, one a manual reassignment) can both try to update the same edition's pointer and per-edition metadata JSON. A `dashboard_build` job triggered by a build and another triggered by a template sync can both try to write the same project's dashboard files. Without coordination these concurrent mutations could interleave KV writes, tear dashboard HTML, or write inconsistent metadata JSON.
 
-Docverse prevents this with **Postgres advisory locks** at two granularities — per-edition and per-project — combined with a **stale build guard** for edition updates.
+Docverse prevents this with **Postgres advisory locks**, combined with a **stale-build supersession guard** in build processing.
 
-#### Lock namespacing
+#### Lock identifiers
 
-Advisory locks use the two-argument form `pg_advisory_lock(classid, objid)` to namespace by resource type, avoiding key collisions between edition and project PKs (which come from different sequences):
+Each lock is a single 64-bit advisory-lock id computed by `compute_lock_id(lock_class, **parts)`: the **high 16 bits** encode a `LockClass` (so a project-level lock can never collide with an edition-level lock that happens to hash to the same value), and the **low 48 bits** are a `blake2b` digest of the resource tuple. blake2b is used rather than Python's built-in `hash()` because it is deterministic across interpreter restarts and worker replicas. There are four lock classes:
 
-- `pg_advisory_lock(1, edition.id)` — edition-level lock, serializes edition content updates and per-edition metadata JSON writes.
-- `pg_advisory_lock(2, project.id)` — project-level lock, serializes project-wide dashboard renders (`__dashboard.html`, `__404.html`, `__switcher.json`).
+| Lock class           | Keyed on                          | Held by                | Serializes                                                            |
+| -------------------- | --------------------------------- | ---------------------- | -------------------------------------------------------------------- |
+| `BUILD_PROCESSING`   | `(org, project, git_ref)`         | `build_processing`     | Builds for the same branch/tag — and their supersession check        |
+| `EDITION_UPDATE`     | `(org, project, edition)`         | `publish_edition`      | An edition's pointer (KV mapping) and its per-edition metadata JSON   |
+| `PROJECT`            | `(org, project)`                  | `dashboard_build`      | A project's dashboard render (`__dashboard.html`, `__404.html`, switcher JSON) |
+| `DASHBOARD_TEMPLATE` | `(owner, repo, ref, root_path)`   | `dashboard_sync`       | The ETag-compare-and-upsert of a shared dashboard-template content row |
 
-Both services acquire locks through a shared `advisory_lock` async context manager that wraps the acquire/release pair, making the lock scope visually explicit and eliminating repeated `try`/`finally` boilerplate:
-
-```python
-@asynccontextmanager
-async def advisory_lock(session, classid, objid):
-    """Acquire a Postgres advisory lock for the duration of the block."""
-    await session.execute(
-        text("SELECT pg_advisory_lock(:classid, :objid)"),
-        {"classid": classid, "objid": objid},
-    )
-    try:
-        yield
-    finally:
-        await session.execute(
-            text("SELECT pg_advisory_unlock(:classid, :objid)"),
-            {"classid": classid, "objid": objid},
-        )
-```
-
-#### Advisory lock acquisition
-
-Before performing any mutation, `EditionService.update()` uses the `advisory_lock` context manager to hold an advisory lock keyed on the edition's primary key for the duration of the update:
+Locks are acquired through the `LockService`, which wraps the `pg_advisory_lock` / `pg_advisory_unlock` pair in an async context manager so the lock scope is visually explicit and released on every exit path:
 
 ```python
-async def update(self, edition, build) -> bool:
-    """Update edition to point to build. Returns True if skipped."""
-    async with advisory_lock(self._session, 1, edition.id):
-        current_build = await self._get_current_build(edition)
-        if current_build and current_build.date_created > build.date_created:
-            return True  # Skipped — edition already has a newer build
-
-        # ... perform KV write / copy-mode update ...
-        # ... log to EditionBuildHistory ...
-        # ... write __editions/{slug}.json metadata ...
-        return False
+lock_key = LockKey.for_edition_update(
+    org_id=org_id, project_id=project.id, edition_id=edition_id
+)
+async with lock_service.acquire(lock_key):
+    # ... publish the edition under the lock ...
 ```
 
-The underlying `pg_advisory_lock()` call blocks (rather than failing) if another session holds the lock for the same key. This means a competing job simply waits its turn — no job is rejected or fails due to contention.
+`pg_advisory_lock()` blocks (rather than failing) if another session holds the same id, so a competing job simply waits its turn — no job is rejected or fails due to contention.
 
-#### Stale build guard
+#### Stale-build supersession guard
 
-After acquiring the lock, the method compares the candidate build's `date_created` against the edition's current build. If the edition already points to a newer build (because a more recent job acquired the lock first), the update is skipped. The caller logs the skip in the job's `progress` JSONB via `mark_edition_skipped`, and the edition slug appears in the `editions_skipped` array rather than `editions_completed`.
-
-This guarantees the edition never regresses to an older build, regardless of the order in which competing jobs acquire the lock.
-
-#### Project-level lock for dashboard renders
-
-`DashboardService.render(project)` acquires a project-level advisory lock before writing the project-wide dashboard files. After releasing the project lock, it acquires each edition's lock in turn to write per-edition metadata JSON, serializing against any concurrent `EditionService.update()` that writes the same file.
-
-```python
-async def render(self, project):
-    """Render all dashboard outputs for a project."""
-    # Project-wide files under project lock
-    async with advisory_lock(self._session, 2, project.id):
-        await self._write_dashboard_html(project)
-        await self._write_404_html(project)
-        await self._write_switcher_json(project)
-
-    # Per-edition metadata under individual edition locks
-    for edition in await self._get_editions(project):
-        async with advisory_lock(self._session, 1, edition.id):
-            await self._write_edition_metadata_json(edition)
-```
-
-No stale guard is needed for dashboard renders. The dashboard output is deterministic from the current database state, so the last render to complete always produces the correct output. The per-edition metadata writes can be parallelized across editions (different lock keys), but each individual write serializes against any concurrent `EditionService.update()` for the same edition.
+`build_processing` acquires the `BUILD_PROCESSING` lock for `(org, project, git_ref)` *before* doing any tarball work, then checks whether a newer build exists for the same branch/tag. If one does, this build is marked **stale-skipped** (its `queue_jobs` row completes with `progress.stale_skipped = true`) and no objects are uploaded or editions touched. Because the check runs inside the lock, two concurrent uploads of the same branch can never both proceed: only the newest build does work; any older build observes a higher latest id and bows out. This guarantees an edition never regresses to an older build of the same ref, regardless of the order in which competing jobs acquire the lock.
 
 #### Why this works
 
-- **No concurrent mutation**: The edition-level advisory lock serializes all updates to a given edition, whether from `build_processing` or `edition_update` jobs. The project-level lock serializes all dashboard renders for a project, whether from build processing, edition updates, template syncs, or manual re-renders.
-- **No failures**: `pg_advisory_lock()` blocks until the lock is available — the job waits rather than failing.
-- **Correct final state**: If Build B (newer) is processed before Build A (older) due to lock acquisition order, Build A's update is skipped by the stale guard. The edition always reflects the most recent build. Dashboard renders are deterministic from database state, so the last render to complete is always correct.
-- **Compatible with `asyncio.gather()`**: Each edition's lock is independent, so parallel updates of *different* editions within the same job proceed without contention. Only updates to the *same* edition across jobs serialize. Similarly, `dashboard_sync` jobs that re-render multiple projects in parallel acquire independent project-level locks.
-- **Covers all code paths**: Placing the edition lock inside `EditionService.update()` covers both the `build_processing` parallel edition phase and the `edition_update` manual reassignment path. Placing the project lock inside `DashboardService.render()` covers all dashboard render triggers. Per-edition metadata JSON is protected in both locations — inside `EditionService.update()` and during `DashboardService.render()`'s per-edition loop.
+- **No concurrent mutation.** The `EDITION_UPDATE` lock serializes all updates to a given edition, whether the `publish_edition` job was enqueued by build processing, a keeper-sync run, or a manual reassignment/rollback. The `PROJECT` lock serializes every dashboard render for a project, whatever triggered it.
+- **No failures.** `pg_advisory_lock()` blocks until the lock is available — the job waits rather than failing.
+- **Correct final state.** Stale builds are discarded by the supersession guard; dashboard renders are deterministic from current database state, so the last render to complete is always correct.
+- **Independent locks parallelize.** Different editions hash to different `EDITION_UPDATE` ids, so the `publish_edition` children fanned out by one build run concurrently on separate workers without contending; only updates to the *same* edition serialize. Likewise, dashboard renders for different projects acquire independent `PROJECT` locks.
 
 #### Connection impact
 
-The advisory lock holds a database session open for the duration of the locked operation. For edition updates in pointer mode (~2 seconds for KV write + cache purge) this is negligible. For copy mode (longer due to object copies), the session is held longer but this is acceptable given expected concurrency levels — at most a few concurrent builds per project. The project-level dashboard lock is held only for the duration of writing the three project-wide files (HTML + JSON), which is sub-second — significantly shorter than edition content updates.
+An advisory lock holds a database session open for the duration of the locked operation. For an edition publish (~2 seconds for the KV write + cache purge) this is negligible. The `BUILD_PROCESSING` lock is held across the (longer) unpack-and-upload phase, but at most a few builds per `(project, git_ref)` are ever in flight at once. The `PROJECT` dashboard lock is held only for the sub-second write of the project-wide files.
 
 ### Operator queries
 
-The `QueueJob` table provides a single place for operators to understand system state across all workers:
+The `queue_jobs` table provides a single place for operators to understand system state across all pools:
 
-- **Backlog depth**: `SELECT count(*), kind FROM queue_job WHERE status = 'queued' GROUP BY kind`
-- **Active work**: `SELECT * FROM queue_job WHERE status = 'in_progress'` — shows what every worker is doing, which phase each job is in, and per-edition progress
-- **Edition update activity**: `SELECT * FROM queue_job WHERE status = 'in_progress' AND project_id = :pid AND phase = 'editions'` — shows concurrent edition work for a project. Advisory locks (see {ref}`cross-job-serialization`) handle serialization automatically; this query is for observability
-- **Error rates**: `SELECT count(*) FROM queue_job WHERE status IN ('failed', 'completed_with_errors') AND date_completed > now() - interval '1 hour'`
-- **Per-org throughput**: `SELECT org_id, count(*) FROM queue_job WHERE status = 'completed' AND date_completed > now() - interval '1 hour' GROUP BY org_id`
-- **Slow jobs**: `SELECT * FROM queue_job WHERE status = 'in_progress' AND date_started < now() - interval '10 minutes'`
+- **Backlog depth**: `SELECT count(*), kind FROM queue_jobs WHERE status = 'queued' GROUP BY kind`
+- **Active work**: `SELECT * FROM queue_jobs WHERE status = 'in_progress'` — shows what every worker is doing, which phase each job is in, and (via `subject_label`) which edition, project, or org it serves
+- **Run progress**: `SELECT status, count(*) FROM queue_jobs WHERE keeper_sync_run_id = :run_id GROUP BY status` — the live breakdown of a keeper-sync backfill (and likewise for `lifecycle_eval_run_id` / `git_ref_audit_run_id`)
+- **Error rates**: `SELECT count(*) FROM queue_jobs WHERE status IN ('failed', 'completed_with_errors') AND date_completed > now() - interval '1 hour'`
+- **Per-org throughput**: `SELECT org_id, count(*) FROM queue_jobs WHERE status = 'completed' AND date_completed > now() - interval '1 hour' GROUP BY org_id`
+- **Slow / stuck jobs**: `SELECT * FROM queue_jobs WHERE status = 'in_progress' AND date_started < now() - interval '10 minutes'` — candidates the reapers will eventually finalize ({ref}`reaper-pattern`)
+
+(job-types)=
 
 ### Job types
 
-#### Build processing (`build_processing`)
+The catalog below is grouped by worker pool. Within each pool, fan-out subsystems are described as a parent/child family.
 
-Triggered when a client signals upload complete (`PATCH .../builds/:build` with `status: uploaded`). This is the primary job type.
+#### Default pool
 
-The service layer executes the following steps inside the single background job:
+##### Build processing (`build_processing`)
 
-1. **Inventory** (sequential) — catalog the build's objects from the object store into the `BuildObject` table in Postgres (key, content hash, content type, size). This is a listing + metadata operation against the object store.
+Triggered when a client signals upload complete (`PATCH .../builds/:build` with `status: uploaded`). This is the primary job type. Under the `BUILD_PROCESSING` lock for `(org, project, git_ref)`, the worker:
 
-2. **Evaluate tracking rules** (sequential) — determine which editions should update based on the build's git ref, the project's edition tracking modes, and the org's rewrite rules. Auto-create new editions if needed (e.g., new semver major stream, new git ref). Returns a list of affected editions.
+1. **Supersession guard** — skip and mark stale if a newer build exists for the same ref ({ref}`cross-job-serialization`).
+2. **Unpack and upload** (`unpacking` → `uploading`) — download the staged tarball, unpack it, upload its objects to the object store under `__builds/{build_id}/` (up to 50 concurrent uploads), record the object count and total size, transition the build to `completed`, and delete the staging tarball.
+3. **Evaluate tracking rules** (`edition_tracking`) — determine which editions should update for this build's git ref, auto-creating editions where tracking rules call for it. Tracking failures are logged but do not fail the build.
+4. **Fan out** — enqueue one `publish_edition` child per updated edition, recording the child job IDs in `progress.publish_jobs`.
+5. **Complete** — mark the `queue_jobs` row `completed` (or `completed_with_errors` if tracking failed).
 
-3. **Update editions** (parallel via `asyncio.gather()`) — for each affected edition, update the edition to point to the new build. In pointer mode this writes a new KV mapping and purges the CDN cache; in copy mode this performs the ordered diff-copy-purge sequence. Each edition update also logs the transition to the `EditionBuildHistory` table. If one edition update fails, the others continue to completion; failures are collected and reported via the `QueueJob` progress JSONB.
+The build job no longer renders the dashboard itself. The dashboard is reached transitively: each `publish_edition` child enqueues a `dashboard_build` on success (deduplicated per project; see below).
 
-4. **Render project dashboard** (sequential, runs once after all edition updates complete) — re-render the project's dashboard and 404 pages using the current edition metadata from the database and the resolved template. A single build may update multiple editions, but the dashboard reflects the project's full edition list and only needs to be rendered once.
+(job-publish-edition)=
 
-5. **Update job status** (sequential) — mark the `QueueJob` as `completed`, `completed_with_errors` (if some editions failed), or `failed`. Also update the build's status accordingly.
+##### Edition publishing (`publish_edition`)
 
-#### Edition reassignment (`edition_update`)
+Syncs a **single** edition's current build to its organization's CDN. This is the worker formerly called `edition_update`; it was renamed and made independently retryable — it resolves all CDN configuration from the database so a retry needs no external context. Under the `EDITION_UPDATE` lock for the edition, it marks the edition and its `EditionBuildHistory` entry `publishing`, performs the CDN sync (KV pointer write or copy-mode object copy + cache purge), and on success marks them `published` and enqueues a `dashboard_build` for the project.
 
-Triggered when an admin PATCHes an edition with a new `build` field (manual reassignment or rollback). Simpler than build processing — a single background job that:
+`publish_edition` jobs are produced by several flows — the `build_processing` fan-out, a `keeper_sync_project` sync (migration), and manual edition reassignment or rollback through `EditionService`. A child enqueued by a keeper-sync run carries `keeper_sync_run_id`, so its terminal transition rolls up into the run's progress and can finalize it.
 
-1. Updates the edition to point to the specified build (pointer mode KV write or copy mode diff-copy).
-2. Logs the transition to `EditionBuildHistory`.
-3. Renders the project dashboard.
+##### Dashboard build (`dashboard_build`)
 
-#### Dashboard template sync (`dashboard_sync`)
+Renders **one project's** dashboard outputs — the dashboard HTML, the pydata-sphinx-theme switcher JSON, the `__404.html` error page, and the per-edition `__editions/{slug}.json` metadata files — and uploads them to the project's object store under the `PROJECT` lock. It is triggered by a `publish_edition` completing, by an admin `POST .../dashboard/rebuild`, or by a `dashboard_sync` template fan-out.
 
-Triggered by a GitHub webhook when a tracked dashboard template repository is updated. A single background job that syncs the template files from GitHub to the object store, then re-renders dashboards for all affected projects (all projects in the org for an org-level template, or a single project for a project-level override), using `asyncio.gather()` to parallelize across projects. See the {ref}`dashboards` section for the full sync flow.
+A partial unique index, `idx_queue_jobs_dashboard_build_active_uq` on `(org_id, project_id)`, allows at most one active (`queued`/`in_progress`) `dashboard_build` per project. The application-side `DashboardBuildEnqueuer` checks for an active build first and skips redundant enqueues — without this, a keeper-sync backfill that publishes 1,000 editions would cascade 1,000 redundant dashboard rebuilds. When the manual `POST .../dashboard/rebuild` endpoint finds a build already active, it returns **HTTP 409**; the index is the database backstop against a read/create race.
 
-#### Lifecycle evaluation (`lifecycle_eval`)
+##### Dashboard template sync (`dashboard_sync`)
 
-Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that scans all orgs and projects for editions and builds matching lifecycle rules (stale drafts, orphan builds). Soft-deletes matching resources and moves object store content to purgatory. Uses `asyncio.gather()` to parallelize across orgs.
+Triggered by a GitHub webhook when a tracked dashboard-**template** repository is updated. Under the `DASHBOARD_TEMPLATE` lock for the content tuple `(owner, repo, ref, root_path)`, it walks `fetching → writing → fanning_out`: it fetches the template from GitHub (ETag-conditional), upserts the template content and files, and — only if the content changed — **fans out** a `dashboard_build` for every project whose resolved template points at the synced content. It differs from `dashboard_build` in that it operates on the template *source* and rebuilds *many* projects, whereas `dashboard_build` renders *one* project's output. See the {ref}`dashboards` section for the full sync flow.
 
-#### Git ref audit (`git_ref_audit`)
+##### Project GitHub resolution (`project_github_resolve`)
 
-Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that verifies git refs tracked by editions still exist on their GitHub repositories. Flags or soft-deletes editions whose refs have been deleted (if the `ref_deleted` lifecycle rule is enabled). Catches cases where GitHub webhook delivery for ref deletion events was missed.
+A lightweight, fire-and-forget job enqueued after a project is created or updated with a GitHub binding. It opportunistically resolves the project's GitHub App installation ID and numeric owner/repo IDs. Failures are logged, never retried into an error: the columns stay null and a later App-installation webhook backfills them. It creates no `queue_jobs` row.
 
-#### Purgatory cleanup (`purgatory_cleanup`)
+##### Health check (`ping`)
 
-Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that hard-deletes object store objects that have been in purgatory longer than the org's configured retention period. Simple listing + batch delete per org.
+A trivial worker that returns `"pong"`, used to verify a pool's workers are alive. No `queue_jobs` row.
 
-#### Inventory census (`inventory_census`)
+(job-keeper-sync)=
 
-Scheduled periodically (see {ref}`periodic-job-scheduling`). A single, **read-only** background job that snapshots current resource *levels*: it counts active (non-deleted) projects, editions, and builds — and sums each scope's `Build.total_size_bytes` — per org and per project, then emits one `resource_inventory` metric per scope (see {ref}`metrics-inventory`). Because it only reads, it needs none of the advisory-lock / stale-guard serialization the mutating jobs use. Parallelized across orgs via `asyncio.gather()`.
+#### Keeper-sync pool
 
-#### Credential re-encryption (`credential_reencrypt`)
+The keeper-sync subsystem migrates documentation from the legacy LTD ("Keeper") platform into Docverse (see {ref}`migration`). It serves two purposes with one per-project worker: an operator-triggered **backfill** that copies an LTD instance into Docverse, and a cron-driven **steady-state reconciler** that keeps already-migrated resources fresh while LTD and Docverse run side by side. It runs on its own pool so a large backfill cannot starve live publishing.
 
-Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that iterates over all `organization_credentials` rows and calls `CredentialEncryptor.rotate()` on each `encrypted_credential` value. This re-encrypts every token under the current primary Fernet key. Unlike Vault's `vault:vN:` prefix, Fernet tokens don't indicate which key encrypted them, so the job processes all rows unconditionally — `MultiFernet.rotate()` is idempotent. This ensures that after a key rotation, all stored credentials are migrated to the new key without ever exposing plaintext. Parallelized across orgs via `asyncio.gather()`.
+##### State and idempotency
+
+A `keeper_sync_state` row records each LTD↔Docverse pairing (one per migrated project, edition, or build): the LTD id/slug, the linked Docverse id, content hashes and ETags, last-synced and last-rebuilt timestamps, and per-tier polling stamps. This row is the idempotency key — a re-sync of unchanged LTD state short-circuits — and the substrate the steady-state tiers poll over. A **tombstone** on the state row (`date_tombstoned` plus a reason: `manual_delete`, `lifecycle_delete`, or `lifecycle_preemptive`) is a permanent veto telling the sync engine "this LTD resource was deleted on the Docverse side; do not re-migrate it." All discovery paths drop tombstoned slugs from their fan-out, and an admin API can list and clear tombstones (clearing also revives the soft-deleted Docverse row).
+
+##### Backfill (`keeper_sync_run_discovery` → `keeper_sync_project`)
+
+An operator starts a backfill by creating a **run** (`POST .../keeper-sync/runs`), which records a `keeper_sync_runs` row and enqueues a `keeper_sync_run_discovery` job. Discovery loads the org's allowlist, fetches LTD's product list, drops out-of-scope and tombstoned slugs, and **fans out** one `keeper_sync_project` child per in-scope project — each attributed to the run via `keeper_sync_run_id`, with the LTD slug in `subject_label`. Each `keeper_sync_project` child syncs one LTD product into Docverse (project → editions → builds), copying build content into the object store and publishing each synced edition through a `publish_edition` job (also attributed to the run). When the last attributed child reaches a terminal state, the run finalizes to `succeeded` or `partial_failure`.
+
+A partial unique index, `idx_queue_jobs_keeper_sync_project_active_uq` on `(org_id, subject_label)`, allows at most one active `keeper_sync_project` per `(org, LTD slug)`, so two concurrent syncs of the same product cannot race on edition creation.
+
+##### Steady-state tiers (`keeper_sync_tier_main` / `_discovery` / `_other`)
+
+Three cron-driven tier reconcilers keep migrated resources fresh without an operator run. They enqueue `keeper_sync_project` children with **no run attribution** (`keeper_sync_run_id` null), and a per-project dormancy gate keeps the long tail of ~1,500 projects from pinning LTD (hot projects poll on the fast cadence; dormant ones fall back to roughly daily, with slug-keyed jitter):
+
+| Tier                          | Cadence  | Targets                                                                |
+| ----------------------------- | -------- | --------------------------------------------------------------------- |
+| `keeper_sync_tier_main`       | 5 min    | `main` editions whose LTD `date_rebuilt` advanced — keeps the user-visible default edition fresh per the migration SLO |
+| `keeper_sync_tier_discovery`  | 30 min   | LTD resources that have no `keeper_sync_state` row yet                 |
+| `keeper_sync_tier_other`      | hourly   | non-`main` editions whose state has aged past the refresh threshold   |
+
+##### Reaper (`keeper_sync_reaper`)
+
+A cron backstop (every 30 minutes) that finalizes silently-stuck rows when Arq loses a job entirely (e.g., an OOM-killed worker pod) and no per-job timeout ever fires. In one transaction it fails timed-out run-attributed children (then finalizes their runs), fails timed-out tier-cron children, and fails orphaned tier-cron rows that never got a backend job. See {ref}`reaper-pattern`.
+
+#### Lifecycle pool
+
+Two periodic maintenance subsystems share this pool. Both use the same dispatcher → per-org fan-out, the same per-org mutex, and the same reaper machinery, but own **disjoint** rule sets, so a rule can only ever fire from its own subsystem.
+
+##### Lifecycle evaluation (`lifecycle_eval_dispatcher` → `lifecycle_eval`)
+
+The `lifecycle_eval_dispatcher` runs **hourly**. It records a `lifecycle_eval_runs` row, then fans out one `lifecycle_eval` child per organization that has lifecycle rules configured (skipping orgs with none, so they get no row). Each per-org `lifecycle_eval` child evaluates two rules over the org's projects:
+
+- **Stale drafts** (`DraftInactivityRule`) — draft editions, not lifecycle-exempt, untouched longer than the configured inactivity window.
+- **Orphan builds** (`BuildHistoryOrphanRule`) — builds no longer pointed at by any edition and aged out of the recent build-history window.
+
+Matches are **soft-deleted** (the resource's `date_deleted` is set; editions are also unpublished from the CDN, and tombstoned against keeper-sync re-migration). Projects whose edition list shrank get a `dashboard_build` enqueued. The structured log line is the audit trail in this version; persistent delete-reason columns are deferred.
+
+##### Git-ref audit (`git_ref_audit_discovery` → `git_ref_audit`)
+
+The `git_ref_audit_discovery` tick runs **daily at 05:17 UTC** (and is Phalanx-feature-gated — the cron stays registered but no-ops when disabled). It records a `git_ref_audit_runs` row and fans out one `git_ref_audit` child per organization that owns a GitHub-bound project. Each per-org child fetches the live ref set from GitHub for each bound project and evaluates a single rule:
+
+- **Deleted refs** (`RefDeletedRule`) — draft editions tracking a `git_ref` / `alternate_git_ref` whose branch or tag no longer exists on the repository are soft-deleted (same unpublish + tombstone path as `lifecycle_eval`).
+
+This catches ref deletions that a missed GitHub webhook would otherwise leave stranded. A per-project GitHub fetch failure isolates to that project: the child completes `completed_with_errors`, rolling its run to `partial_failure`, without aborting the rest of the org's audit. `git_ref_audit` is a distinct concern from `lifecycle_eval` — it requires GitHub I/O and runs daily — but deliberately reuses the same fan-out, mutex, and reaper patterns rather than competing for worker capacity on the default pool.
+
+##### Per-org mutex
+
+Both subsystems use a single-column partial unique index on `org_id` (`idx_queue_jobs_lifecycle_eval_active_uq` and `idx_queue_jobs_git_ref_audit_active_uq`), allowing at most one active per-org child per kind. Unlike `keeper_sync_project`'s mutex, `subject_label` is **not** part of the identity here: lifecycle-eval and git-ref-audit are per-org by design, with no sub-key under the org, so the org id alone is the mutex. (The row still carries `subject_label = org.slug` for readability.) A slow per-org pass therefore cannot be doubled up by the next tick.
+
+(reaper-pattern)=
+
+#### The reaper pattern
+
+Arq's per-job `timeout` covers a worker that runs too long, but if a worker pod is OOM-killed mid-job — or the producer crashed between committing the `queue_jobs` row and enqueuing the Arq job — no timeout ever fires, and the row is wedged `in_progress` (or `queued` with no `backend_job_id`) forever. For a kind that holds an active mutex, that wedged row also blocks every future enqueue for the same key. **Reapers** are cron jobs that sweep these stuck rows and finalize them.
+
+Each reaper performs two sweeps in one transaction:
+
+- **Silent** — rows `in_progress` past a per-kind staleness threshold are marked `failed` with an error `type` of `SilentWorker`.
+- **Orphan** — rows `queued` with `backend_job_id IS NULL`, older than a shared 5-minute window, are marked `failed` with type `OrphanedQueueJob`.
+
+The default-pool kinds get **run-less** reapers (a shared helper, one thin module per kind so each can have its own cron stagger and operator narrative). The fan-out subsystems get **run-aware** reapers that additionally finalize the parent run after failing its stuck children. To keep one horizontally scaled pool from co-firing two reapers against `queue_jobs` at the same instant, the lifecycle-pool reapers are staggered onto disjoint minute slots.
+
+| Reaper                    | Targets kind(s)                       | Silent threshold | Cron cadence (minute)        |
+| ------------------------- | ------------------------------------- | ---------------- | ---------------------------- |
+| `dashboard_build_reaper`  | `dashboard_build`                     | 30 min           | every 15 min — `{3,18,33,48}` |
+| `publish_edition_reaper`  | `publish_edition`                     | 4 h              | every 30 min — `{6,36}`       |
+| `build_processing_reaper` | `build_processing`                    | 8 h              | every 30 min — `{12,42}`      |
+| `dashboard_sync_reaper`   | `dashboard_sync`                      | 6 h              | every 30 min — `{24,54}`      |
+| `lifecycle_reaper`        | `lifecycle_eval` **and** `git_ref_audit` | 6 h           | every 30 min — `{0,30}`       |
+| `keeper_sync_reaper`      | `keeper_sync_project` (+ tier-cron)   | 6 h              | every 30 min — `{0,30}`       |
+
+`dashboard_build` gets the tightest cadence because it is the only main-pool kind whose wedge is user-visible (the 409 on `POST .../dashboard/rebuild`); its 30-minute threshold plus 15-minute cron caps worst-case recovery near 45 minutes. `build_processing`'s 8-hour threshold is deliberately generous so a genuinely large multi-hour upload is never falsely reaped. All thresholds are configurable per deployment.
+
+(planned-periodic-jobs)=
+
+#### Planned periodic jobs
+
+Three periodic jobs are designed but **not yet implemented**. They are documented here and referenced elsewhere in this note; when built, each will follow the same Arq-cron pattern as the jobs above.
+
+- **Purgatory cleanup** (`purgatory_cleanup`) — hard-delete object-store content that has sat in purgatory past the org's retention period. (Lifecycle and audit jobs currently soft-delete; reclaiming the underlying storage is this job's responsibility.)
+- **Credential re-encryption** (`credential_reencrypt`) — iterate every stored organization credential and re-encrypt it under the current primary Fernet key after a key rotation (see {ref}`periodic-job-scheduling` and the credential-rotation discussion in the organizations section).
+- **Inventory census** (`inventory_census`) — a read-only snapshot of resource *levels* (active project / edition / build counts and storage footprint per org and project) that emits the `resource_inventory` metric (see {ref}`metrics-inventory`). Because it only reads, it needs none of the advisory-lock / supersession machinery the mutating jobs use.
 
 (periodic-job-scheduling)=
 
 ### Periodic job scheduling
 
-Periodic jobs are scheduled using **Kubernetes CronJobs** rather than the queue backend's built-in scheduling features (e.g., Arq's cron). This keeps scheduling decoupled from the queue backend, enabling backend swaps without changing scheduling infrastructure. Kubernetes CronJobs are well-understood, observable, and already used throughout Phalanx.
+Periodic and orchestration jobs are scheduled with **Arq's built-in cron** (`arq.cron`), declared as `cron_jobs` on the worker settings for the pool that owns them. Each cron tick runs directly in the worker process — the tier reconcilers and the fan-out dispatchers create their run rows and enqueue children inline, with no separate scheduler deployment to operate.
 
-Each periodic job type gets a CronJob that runs a thin CLI command to create a `QueueJob` record and enqueue it via the queue backend:
-
-```{code-block} yaml
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: docverse-lifecycle-eval
-spec:
-  schedule: "0 3 * * *"
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          containers:
-            - name: docverse-enqueue
-              image: ghcr.io/lsst-sqre/docverse:latest
-              command: ["docverse-admin", "enqueue", "lifecycle_eval"]
-          restartPolicy: OnFailure
+```{code-block} python
+:caption: Cron declarations on a worker's settings (illustrative)
+class LifecycleEvalWorkerSettings:
+    cron_jobs = [
+        cron(lifecycle_eval_dispatcher, minute={0}),       # hourly
+        cron(git_ref_audit_discovery, hour={5}, minute={17}),  # daily 05:17 UTC
+        cron(lifecycle_reaper, minute={0, 30}),            # every 30 min
+        # ... staggered run-less reaper backstops ...
+    ]
 ```
 
-The `docverse-admin enqueue` CLI command connects to the database and Redis, creates a `QueueJob` record with `status: queued`, enqueues the job via the queue backend, and exits. The actual work is performed by the Docverse worker process.
+The keeper-sync tier cadences are derived from interval constants in the scheduler module and converted to Arq `minute={…}` sets by a shared helper, so the cron schedule and the planner's "next tick" math cannot drift.
 
 #### Schedule table
 
-| Job type           | Default schedule       | Description                                  |
-| ------------------ | ---------------------- | -------------------------------------------- |
-| `lifecycle_eval`   | Daily at 03:00 UTC     | Evaluate edition and build lifecycle rules    |
-| `git_ref_audit`    | Daily at 04:00 UTC     | Verify git refs tracked by editions           |
-| `purgatory_cleanup`| Daily at 05:00 UTC     | Hard-delete expired purgatory objects          |
-| `inventory_census` | Daily at 06:00 UTC     | Snapshot resource counts and storage footprint per org/project |
-| `credential_reencrypt`| Weekly (Sunday 02:00)  | Re-encrypt credentials under current primary Fernet key |
+| Job                          | Pool        | Cadence                       | Purpose                                                       |
+| ---------------------------- | ----------- | ----------------------------- | ------------------------------------------------------------ |
+| `keeper_sync_tier_main`      | keeper-sync | every 5 min                   | Refresh migrated `main` editions whose LTD build advanced     |
+| `keeper_sync_tier_discovery` | keeper-sync | every 30 min                  | Discover LTD resources with no sync-state row yet             |
+| `keeper_sync_tier_other`     | keeper-sync | hourly                        | Refresh non-`main` editions aged past the threshold           |
+| `keeper_sync_reaper`         | keeper-sync | every 30 min                  | Finalize stuck keeper-sync jobs and their runs                |
+| `lifecycle_eval_dispatcher`  | lifecycle   | hourly                        | Fan out per-org lifecycle-eval children                       |
+| `git_ref_audit_discovery`    | lifecycle   | daily, 05:17 UTC              | Fan out per-org git-ref-audit children (feature-gated)        |
+| `lifecycle_reaper`           | lifecycle   | every 30 min                  | Finalize stuck `lifecycle_eval` + `git_ref_audit` jobs/runs   |
+| reaper backstops             | lifecycle   | 15–30 min, staggered          | Finalize stuck default-pool jobs (see {ref}`reaper-pattern`)  |
 
-Schedules are configurable per-deployment via Phalanx Helm values. Operators can adjust frequencies, add maintenance windows, or disable specific jobs without code changes.
+Cadences, the daily audit window, and feature gates are configurable per deployment via Phalanx Helm values, so operators can retune frequencies or disable a job without code changes. The **planned** periodic jobs ({ref}`planned-periodic-jobs`) will join this table when implemented — e.g. `purgatory_cleanup` daily, `credential_reencrypt` weekly, `inventory_census` daily.
+
+> **Design note.** An earlier revision of this section proposed scheduling periodic jobs with **Kubernetes CronJobs** that shell out to a `docverse-admin enqueue <type>` CLI, to decouple scheduling from the queue backend. The implementation uses Arq cron instead. With a large and growing set of distinct periodic and orchestration jobs, declaring each as a Kubernetes CronJob would push substantial complexity into the Phalanx Helm charts, which are managed separately from the application — every new job, cadence change, or feature gate would become a chart edit. Keeping the schedule in code alongside the workers makes adding and tuning jobs a single-repository change, and the per-pool isolation already prevents cron work from interfering with latency-sensitive jobs. The trade-off is that the cron schedule lives with the queue backend rather than in Kubernetes; a backend swap would re-declare the crons against the new backend's scheduling primitive.
 
 ### Failure and retry
 
-The queue backend handles job-level retries. With Arq, retry behavior is configured per job type via the worker's job definitions. The retry policy varies by job type:
+Retry behavior is configured per pool and per job type:
 
-- **build_processing** and **edition_update**: retry with backoff, up to 3 attempts. Jobs are idempotent at each step — inventory upserts, tracking evaluation is deterministic, edition updates use diffs (already-updated editions show no changes on re-run). On retry, the job re-runs from the beginning but completed steps are effectively no-ops. The `QueueJob` progress is reset at the start of each attempt.
-- **Periodic jobs** (lifecycle_eval, git_ref_audit, purgatory_cleanup, inventory_census): retry once, then wait for the next scheduled run. These are self-correcting — anything missed on one run will be caught on the next (for inventory_census, a missed snapshot is simply a gap in the series, filled by the next run's absolute counts).
+- **Default-pool jobs** (`build_processing`, `publish_edition`, `dashboard_build`, `dashboard_sync`) use Arq's default retry-with-backoff. They are idempotent on retry — inventory upserts, deterministic tracking, and diff-based publishes mean a re-run of a completed step is effectively a no-op.
+- **Fan-out workers on the dedicated pools** (`keeper_sync_run_discovery`, `keeper_sync_project`, `lifecycle_eval_dispatcher`, `lifecycle_eval`, `git_ref_audit_discovery`, `git_ref_audit`) run with **`max_tries=1`** and an explicit per-job **timeout**, rather than Arq's 5-attempt default. A failure must surface *promptly* so the worker's `except` block can route to `queue_job_store.fail()` and the parent run can finalize via its finaliser; a silent multi-attempt retry would only delay finalization and bury the error. The per-job timeout is the first backstop against a runaway job; the cron reaper ({ref}`reaper-pattern`) is the second, for the case where Arq loses the job entirely and no timeout fires.
 
-Within a build processing job, individual edition update failures (in the `asyncio.gather()`) do not fail the entire job. The service layer uses `return_exceptions=True`, collects results, and marks the job as `completed_with_errors` if some editions failed while others succeeded. Failed editions are recorded in the `progress` JSONB with error messages for diagnosis. A subsequent retry or manual edition PATCH can address individual failures.
+Within build processing, edition publishing is fanned out, so a single edition's publish failure is isolated to its own `publish_edition` child — the build job itself completes, and the failed child is retried or addressed independently. Edition-tracking failure inside `build_processing` is non-fatal: the build is marked `completed_with_errors` and no publish children are spawned.
 
 ### Job retention
 
-Completed and failed `QueueJob` records are retained for a configurable period (default: 7 days) before being cleaned up by the purgatory cleanup job. The queue API returns 404 for expired jobs.
+Completed and failed `queue_jobs` records are retained for a configurable period (default: 7 days) before cleanup. The queue API returns 404 for expired jobs. Reaping object-store content left behind by soft-deleted resources is the responsibility of the planned `purgatory_cleanup` job ({ref}`planned-periodic-jobs`).
