@@ -95,7 +95,7 @@ Before designing custom events, it is worth cataloging what the platform emits *
 
 #### Generic Arq queue metrics
 
-Safir's Arq integration emits queue metrics with two small hooks per worker: `initialize_arq_metrics` in the worker's `on_startup`, and `make_on_job_start(queue_name)` composed into `on_job_start`. With these, every job execution publishes an `arq_job_run` event carrying `time_in_queue` (how long the job waited before a worker picked it up) and `queue` (the queue name), and a periodic `publish_queue_stats` call emits `arq_queue_stats` with `num_queued`. Docverse runs three Arq queues — the **default** queue, the dedicated **keeper-sync** queue, and the dedicated **lifecycle-eval** queue (see {ref}`worker-environments`) — and each can carry these generic metrics independently.
+Safir's Arq integration emits queue metrics with two small hooks per worker: `initialize_arq_metrics` in the worker's `on_startup`, and `make_on_job_start(queue_name)` composed into `on_job_start`. With these, every job execution publishes an `arq_job_run` event carrying `time_in_queue` (how long the job waited before a worker picked it up) and `queue` (the queue name), and a periodic `publish_queue_stats` call emits `arq_queue_stats` with `num_queued`. Docverse runs three Arq queues — the **default** queue, the dedicated **keeper-sync** queue, and the dedicated **lifecycle** queue (see {ref}`worker-pools`) — and each can carry these generic metrics independently.
 
 These are valuable for **queue health**: backlog depth and scheduling latency per queue. Their limitation for product analytics is that they are dimensioned only by *queue*, not by organization, project, job kind, or outcome. The default queue alone runs `build_processing`, `publish_edition`, and `dashboard_build` jobs; `arq_job_run` cannot tell them apart, and it has no notion of whether a job succeeded or what tenant it served.
 
@@ -281,7 +281,7 @@ The census job derives every field from a grouped aggregate over the active rows
 
 #### The dedicated census job
 
-The snapshot is produced by a new `inventory_census` periodic job on its own Kubernetes CronJob, defaulting to a **daily** cadence independent of the other periodic jobs (it is *not* piggybacked on `lifecycle_eval`, so the snapshot frequency can be tuned for product reporting without perturbing the reaper). It follows the established `docverse-admin enqueue <type>` pattern; see {ref}`periodic-job-scheduling` for the CronJob mechanism and {ref}`queue` for the job-type entry.
+The snapshot is produced by a planned `inventory_census` periodic job on its own Arq cron schedule, defaulting to a **daily** cadence independent of the other periodic jobs (it is *not* piggybacked on `lifecycle_eval`, so the snapshot frequency can be tuned for product reporting without perturbing the lifecycle sweep). See {ref}`periodic-job-scheduling` for the cron mechanism and {ref}`planned-periodic-jobs` for the job-type entry.
 
 #### The builds-per-edition boundary
 
