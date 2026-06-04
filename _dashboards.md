@@ -461,16 +461,16 @@ The `switcher_url` and `dashboard_url` fields provide stable references to the p
 
 ### Re-render triggers
 
-Dashboard re-rendering is triggered by several events, all funneled through the task queue:
+Dashboard re-rendering always runs as its own `dashboard_build` job — a project's dashboard is never rendered inline inside another job. The events that enqueue one, all funneled through the task queue:
 
-| Event                           | Trigger mechanism                     | Scope                              |
-| ------------------------------- | ------------------------------------- | ---------------------------------- |
-| Template repo push              | GitHub webhook → `dashboard_sync` job | All projects using that template   |
-| Build processing completes      | Final step of `build_processing` job  | Single project                     |
-| Edition created/deleted/updated | Final step of `edition_update` job    | Single project                     |
-| Project metadata changed        | Enqueued by PATCH handler             | Single project                     |
-| Manual re-render                | Admin API endpoint (if needed)        | Single project or all org projects |
+| Event                             | Trigger mechanism                                              | Scope                            |
+| --------------------------------- | ------------------------------------------------------------- | -------------------------------- |
+| Edition published                 | `publish_edition` enqueues a `dashboard_build` on success     | Single project                   |
+| Lifecycle / audit reaping         | `lifecycle_eval` and `git_ref_audit` enqueue a `dashboard_build` when a project's edition set changes | Single project |
+| Project metadata changed          | PATCH handler enqueues a `dashboard_build`                     | Single project                   |
+| Manual re-render                  | Admin `POST .../dashboard/rebuild` enqueues a `dashboard_build` | Single project                  |
+| Template repo push                | GitHub webhook → `dashboard_sync` job, which fans out a `dashboard_build` per project | All projects using that template |
 
-For single-project re-renders triggered within other jobs (build processing, edition update), the render is performed inline as the final step — no separate job is enqueued. Only template syncs (which affect multiple projects) spawn their own `dashboard_sync` job.
+Because a build is fanned out into one `publish_edition` job per edition (see {ref}`job-types`), a build that updates several editions would enqueue several `dashboard_build` jobs. These are collapsed by the per-project active-build mutex: at most one `dashboard_build` is `queued`/`in_progress` per project, so redundant enqueues are skipped (and the manual rebuild endpoint returns HTTP 409 when one is already active). A template sync spawns one `dashboard_build` per affected project rather than rendering them inline.
 
-Multiple triggers can race on the same project's dashboard files (e.g., two `build_processing` jobs, or a `build_processing` and a `dashboard_sync` job running concurrently). Docverse uses Postgres advisory locks at the project and edition level to serialize these writes. See {ref}`cross-job-serialization` for the locking strategy.
+Multiple `dashboard_build` jobs — or a `dashboard_build` and a `dashboard_sync` fan-out — can still target the same project's dashboard files. Docverse serializes these writes with a project-scoped Postgres advisory lock. See {ref}`cross-job-serialization` for the locking strategy.

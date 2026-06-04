@@ -47,6 +47,8 @@ This technote dives into the design of Docverse at a fairly technical level to p
 - [Dashboard templating system](#dashboards) describes the new dashboard templating system that allows edition dashboards to be built from templates stored in GitHub repositories.
 - [Code architecture](#code-architecture) describes Docverse's layered architecture, factory pattern for multi-tenant client construction, protocol-based abstractions for object stores and CDN providers, and the client-server monorepo structure including the Python client library and CLI.
 - [Queue system](#queue) describes the queue system for processing edition updates and build uploads, built on a backend-agnostic abstraction with Arq as the initial implementation.
+- [Application metrics](#metrics) describes how Docverse captures product-analytics metrics through Safir, Kafka, and Sasquatch to understand how the platform is used, and how this signal is distinct from operational observability.
 - [REST API design](#api) describes the API design and schema definitions for Docverse.
+- [Database models](#dbschema) provides a centralized reference for the PostgreSQL schema, including the entity-relationship diagram and column definitions for each table.
 - [GitHub Actions action](#github-action) describes the native JavaScript GitHub Action for uploading documentation builds from GitHub Actions workflows.
 - [Migration from LSST the Docs](#migration) covers the data and client migration plan for moving existing LTD deployments to Docverse, including migration tooling, phased rollout, and risk mitigation.
