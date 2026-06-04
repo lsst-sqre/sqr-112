@@ -111,8 +111,9 @@ The comment uses a Markdown table to list all updated editions with their publis
 Build `01HQ-3KBR-T5GN-8W` processed successfully.
 ````
 
-Edition data is extracted from the completed job's `editions_completed` progress array (see {ref}`queue`).
-For partial failures (job status `completed_with_errors`), successful editions appear in the main table; failed and skipped editions are listed in a collapsible `<details>` block below.
+Because build processing fans out a separate `publish_edition` job per edition (see {ref}`job-types`), the build job's progress lists the updated edition slugs (`editions_updated`) and the child publish jobs it spawned (`publish_jobs`) rather than an `editions_completed` array.
+When `wait` is enabled, the action follows the `publish_jobs` references until each `publish_edition` child reaches a terminal status, resolving every published edition's URL from its project's URL space.
+Successfully published editions appear in the main table; editions whose `publish_edition` child failed, and editions the build skipped (`editions_skipped`, e.g. superseded), are listed in a collapsible `<details>` block below.
 
 #### Comment deduplication
 
@@ -133,7 +134,7 @@ Without the host in the marker the two builds would target the same comment and 
 
 - **Job failed**: the comment reports the failure status and build ID instead of an edition table.
 - **No editions updated**: the comment notes that no editions were updated and includes the build ID.
-- **Partial failure** (`completed_with_errors`): successful editions appear in the main table; failed and skipped editions are listed in a collapsible `<details>` block.
+- **Partial failure**: some editions published while others failed — successful editions appear in the main table; editions whose `publish_edition` child failed, and skipped editions, are listed in a collapsible `<details>` block.
 - **Token lacks permissions**: the GitHub API returns 403; the action logs a warning via `core.warning()` but does not fail the step (the upload itself succeeded).
 - **No PR context**: the comment step is skipped silently; the build proceeds normally.
 
