@@ -17,7 +17,7 @@ Docverse maintains its own `QueueJob` table in Postgres as the single source of 
 | `id`             | int                     | Internal PK                                                                                                    |
 | `public_id`      | int                     | Crockford Base32 serialized in API                                                                             |
 | `backend_job_id` | str (nullable)          | Reference to the queue backend's job ID (e.g., Arq UUID)                                                       |
-| `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup`, `credential_reencrypt` |
+| `kind`           | enum                    | `build_processing`, `edition_update`, `dashboard_sync`, `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup`, `inventory_census`, `credential_reencrypt` |
 | `status`         | enum                    | `queued`, `in_progress`, `completed`, `completed_with_errors`, `failed`, `cancelled`                           |
 | `phase`          | str (nullable)          | Current phase: `inventory`, `tracking`, `editions`, `dashboard`                                                |
 | `org_id`         | FK → Organization       | Scoped to org (for operator filtering)                                                                         |
@@ -371,6 +371,10 @@ Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background
 
 Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that hard-deletes object store objects that have been in purgatory longer than the org's configured retention period. Simple listing + batch delete per org.
 
+#### Inventory census (`inventory_census`)
+
+Scheduled periodically (see {ref}`periodic-job-scheduling`). A single, **read-only** background job that snapshots current resource *levels*: it counts active (non-deleted) projects, editions, and builds — and sums each scope's `Build.total_size_bytes` — per org and per project, then emits one `resource_inventory` metric per scope (see {ref}`metrics-inventory`). Because it only reads, it needs none of the advisory-lock / stale-guard serialization the mutating jobs use. Parallelized across orgs via `asyncio.gather()`.
+
 #### Credential re-encryption (`credential_reencrypt`)
 
 Scheduled periodically (see {ref}`periodic-job-scheduling`). A single background job that iterates over all `organization_credentials` rows and calls `CredentialEncryptor.rotate()` on each `encrypted_credential` value. This re-encrypts every token under the current primary Fernet key. Unlike Vault's `vault:vN:` prefix, Fernet tokens don't indicate which key encrypted them, so the job processes all rows unconditionally — `MultiFernet.rotate()` is idempotent. This ensures that after a key rotation, all stored credentials are migrated to the new key without ever exposing plaintext. Parallelized across orgs via `asyncio.gather()`.
@@ -410,6 +414,7 @@ The `docverse-admin enqueue` CLI command connects to the database and Redis, cre
 | `lifecycle_eval`   | Daily at 03:00 UTC     | Evaluate edition and build lifecycle rules    |
 | `git_ref_audit`    | Daily at 04:00 UTC     | Verify git refs tracked by editions           |
 | `purgatory_cleanup`| Daily at 05:00 UTC     | Hard-delete expired purgatory objects          |
+| `inventory_census` | Daily at 06:00 UTC     | Snapshot resource counts and storage footprint per org/project |
 | `credential_reencrypt`| Weekly (Sunday 02:00)  | Re-encrypt credentials under current primary Fernet key |
 
 Schedules are configurable per-deployment via Phalanx Helm values. Operators can adjust frequencies, add maintenance windows, or disable specific jobs without code changes.
@@ -419,7 +424,7 @@ Schedules are configurable per-deployment via Phalanx Helm values. Operators can
 The queue backend handles job-level retries. With Arq, retry behavior is configured per job type via the worker's job definitions. The retry policy varies by job type:
 
 - **build_processing** and **edition_update**: retry with backoff, up to 3 attempts. Jobs are idempotent at each step — inventory upserts, tracking evaluation is deterministic, edition updates use diffs (already-updated editions show no changes on re-run). On retry, the job re-runs from the beginning but completed steps are effectively no-ops. The `QueueJob` progress is reset at the start of each attempt.
-- **Periodic jobs** (lifecycle_eval, git_ref_audit, purgatory_cleanup): retry once, then wait for the next scheduled run. These are self-correcting — anything missed on one run will be caught on the next.
+- **Periodic jobs** (lifecycle_eval, git_ref_audit, purgatory_cleanup, inventory_census): retry once, then wait for the next scheduled run. These are self-correcting — anything missed on one run will be caught on the next (for inventory_census, a missed snapshot is simply a gap in the series, filled by the next run's absolute counts).
 
 Within a build processing job, individual edition update failures (in the `asyncio.gather()`) do not fail the entire job. The service layer uses `return_exceptions=True`, collects results, and marks the job as `completed_with_errors` if some editions failed while others succeeded. Failed editions are recorded in the `progress` JSONB with error messages for diagnosis. A subsequent retry or manual edition PATCH can address individual failures.
 

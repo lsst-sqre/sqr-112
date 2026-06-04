@@ -19,6 +19,8 @@ This focus draws a clear line between metrics and the other observability planes
 
 Application metrics deliberately do **not** duplicate any of these. They are not telemetry (resource utilization is an infrastructure concern), not logs (a log line answers "what happened in this one operation"; a metric answers "how often does this happen across all tenants"), and not Sentry error tracking (Sentry is already integrated for exception capture, as seen in the `sentry_sdk.capture_exception` calls throughout the worker functions). The metrics pipeline answers questions that none of the operational planes can: aggregate, longitudinal product usage sliced by tenant and operation.
 
+Most of the catalog below records event *flows* — discrete things that *happened* (a build processed, an edition published, a project deleted). Alongside these flows, Docverse also emits periodic *inventory snapshots* that report current resource *levels* — how many projects, editions, and builds exist right now — as a complementary gauge signal (see {ref}`metrics-inventory`). The framing table is therefore "events and snapshots," not "events only."
+
 A defining characteristic of Docverse shapes *which* users the application can even observe. The "users" visible to the Docverse application are **documentation authors, CI systems, and organization administrators** — the principals who upload builds, manage editions, and configure projects through the API. Documentation **readers** are invisible to the application: they fetch pages from a CDN that serves directly from object storage and never touch Docverse (see {ref}`documentation-hosting`). Application metrics therefore measure the *authoring and publishing* side of the platform. Reader-side analytics is a separate concern handled by a different pipeline (see {ref}`metrics-reader-analytics`).
 
 ### The Safir metrics mechanism
@@ -244,6 +246,47 @@ Time-boxed and operational-adjacent events. The keeper-sync event is most releva
 | `action`       | enum        | `edition_purged`, `build_purged`, or `ref_deleted`.            |
 | `count`        | int         | Number of resources affected by this action.                  |
 
+(metrics-inventory)=
+
+### Inventory snapshots: measuring resource levels
+
+The event catalog above answers questions of the form "how *often* does X happen" — it is a record of *flows*: a build was processed, an edition was published, a project was deleted. A different class of product question asks "how *many* X exist *right now*": how many projects are in an organization, how many editions are in a project, how many builds are in storage for a project. These are *stock* (level) questions, and the flow catalog cannot answer them reliably.
+
+The tempting shortcut — reconstruct a level by summing its flow events, e.g. `project_lifecycle` `created` minus `deleted` — does not hold up. The production `EventManager` runs with `raise_on_error=False`, so a publish lost to a Kafka outage or schema-registry hiccup is silently dropped and never reconciled; a cumulative sum therefore drifts without bound. The drift compounds against two further realities: InfluxDB retention windows expire old events, so there is no "sum since the beginning of time" to anchor to, and resources created before instrumentation existed (or migrated in from LTD) never fired a `created` event at all, so there is no baseline floor. {sqr}`089` frames Safir metrics purely as event flows for understanding *how people use* a service and offers no snapshot pattern, so the level signal is designed here.
+
+#### The snapshot pattern
+
+Docverse measures levels with a **periodic inventory snapshot**: a *gauge* layered on the same event transport. A scheduled job reads the current counts straight from the database and publishes a single self-contained `resource_inventory` event carrying absolute numbers. Because each snapshot reports absolute truth rather than a delta, a dropped publish is a *gap*, not drift — the next run re-reports the current level and the series self-heals. The automatic `timestamp` / `timestamp_ns` metadata that the `EventManager` mixes into every event supplies the time axis for free, so the snapshots form a time series with no extra fields. Consumers query the level with InfluxDB's `last()` (the current count) or plot the measurement directly (growth over time) — never `count()`, which would count *snapshots*, not resources.
+
+This *complements* the `lifecycle_action` event rather than duplicating it. `lifecycle_action` measures the *rate of reaping* — a flow, "how many builds were purged this run." `resource_inventory` measures the *resulting level* — a stock, "how many builds remain in storage now." Together they answer both "how fast are we reaping" and "what is the footprint after reaping."
+
+#### The `resource_inventory` event
+
+A single event carries the whole snapshot, with scope expressed through a nullable `project` — the same dual-scope idiom used elsewhere in the catalog (consistent with **D4**). Each run emits one **org-scoped** row per organization (`project` null, the org-wide rollup) **plus** one **project-scoped** row per project (`project` set, that project's counts):
+
+| Field               | Type        | Description                                                                                  |
+| ------------------- | ----------- | -------------------------------------------------------------------------------------------- |
+| `organization`      | str         | Tenant slug (from base).                                                                     |
+| `project`           | str \| null | Project slug when project-scoped; null for the org-wide rollup row.                          |
+| `project_count`     | int \| null | Active (non-deleted) projects in the org. Org-scoped row only; null at project scope.        |
+| `edition_count`     | int         | Active editions in scope (org total, or the project's).                                      |
+| `build_count`       | int         | Active (non-deleted) builds in scope.                                                        |
+| `total_build_bytes` | int         | Summed `Build.total_size_bytes` of active builds in scope — the live storage footprint.      |
+
+The payload is a flat record of scalars, honoring the scalar-only constraint that governs the rest of the catalog. The same shape accommodates natural extensions if they are wanted later — for example a `purgatory_bytes` field (reap-pending storage still on the cost ledger) or a `member_count` on the org-scoped row — without changing the event's structure.
+
+#### Source queries
+
+The census job derives every field from a grouped aggregate over the active rows: `COUNT` of `project` / `edition` / `build` and `SUM` of `Build.total_size_bytes`, each filtered `WHERE date_deleted IS NULL` and grouped by org (and, for the project-scoped rows, by project). These run through the existing `WorkerFactory` stores, the same database access the workers already use. The job only reads, so it needs none of the advisory-lock / stale-guard serialization machinery that the mutating jobs require (see {ref}`cross-job-serialization`).
+
+#### The dedicated census job
+
+The snapshot is produced by a new `inventory_census` periodic job on its own Kubernetes CronJob, defaulting to a **daily** cadence independent of the other periodic jobs (it is *not* piggybacked on `lifecycle_eval`, so the snapshot frequency can be tuned for product reporting without perturbing the reaper). It follows the established `docverse-admin enqueue <type>` pattern; see {ref}`periodic-job-scheduling` for the CronJob mechanism and {ref}`queue` for the job-type entry.
+
+#### The builds-per-edition boundary
+
+"How many builds are in storage for an *edition*" is intentionally **not** a metric, because it is not a stored quantity. Builds belong to the *project*; an edition is a pointer at a single `current_build_id` plus an `EditionBuildHistory` log of which builds it has pointed at over time (see {ref}`table-edition-build-history`). `build_count` per project therefore answers the real question — "how many builds are in storage for a project." Per-edition build and orphan accounting is the job of `lifecycle_eval` scanning `EditionBuildHistory`, not a time-series metric: surfacing it as a gauge would require an `edition_slug` dimension, which **D5** excludes as high-cardinality.
+
 (metrics-reader-analytics)=
 
 ### Reader analytics and the page-view boundary
@@ -269,6 +312,8 @@ Reader-side analytics is instead handled by **[Plausible.io](https://plausible.i
 **D6 — Initialize the `DocverseEvents` `EventMaker` in both the app factory and the worker startup.** Events fire from both API handlers (e.g. `build_uploaded`, `project_lifecycle`) and background workers (e.g. `build_processed`, `edition_published`). The `EventManager` and the `DocverseEvents` container must therefore be initialized in *both* the FastAPI application factory (its lifespan) and each Arq worker's `on_startup`, and threaded to call sites the same way Docverse already threads structlog and Sentry — through `RequestContext`/`Factory` for handlers and through the worker `ctx` dict for workers. This mirrors existing plumbing rather than introducing a new injection mechanism (see {ref}`code-architecture`).
 
 **D7 — Disambiguate shared-worker flows with low-cardinality `trigger` enums.** Several flows share a worker: `publish_edition` runs for build-driven updates, manual reassignment/rollback, and migration; `dashboard_build` runs for build, manual, and template-sync triggers. Rather than minting a separate event name per flow, the catalog adds a bounded `trigger` enum to the one event (`edition_published`, `dashboard_built`). This keeps the event-name space small while preserving the ability to slice by originating flow — the same philosophy as **D4**, applied to provenance rather than verb.
+
+**D8 — Measure resource levels with periodic snapshots, not cumulative event sums.** "How many projects / editions / builds exist" are *stock* questions; the flow catalog answers "how often." Reconstructing a level from `created` − `deleted` events is unreliable under best-effort delivery (`raise_on_error=False`) and finite InfluxDB retention. Docverse instead emits a self-contained `resource_inventory` gauge from a periodic database read ({ref}`metrics-inventory`), queried with `last()`. Per-edition build counts are deliberately project-aggregated (per **D5**: builds belong to the project; an edition is a pointer with a history log).
 
 ### Implementation and testing notes
 
